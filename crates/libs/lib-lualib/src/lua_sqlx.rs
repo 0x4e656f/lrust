@@ -570,8 +570,16 @@ where
                             let v = sqlx::decode::Decode::decode(value).unwrap_or(0i32);
                             row_table.insert(*column_name, v);
                         }
+                        "INT4 UNSIGNED" | "INT UNSIGNED" | "INTEGER UNSIGNED" | "MEDIUMINT UNSIGNED" => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0u32);
+                            row_table.insert(*column_name, v);
+                        }
                         "INT8" | "BIGINT" => {
                             let v = sqlx::decode::Decode::decode(value).unwrap_or(0i64);
+                            row_table.insert(*column_name, v);
+                        }
+                        "INT8 UNSIGNED" | "BIGINT UNSIGNED" => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0u64);
                             row_table.insert(*column_name, v);
                         }
                         "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "TINYTEXT"
