@@ -566,14 +566,14 @@ where
                         row_table.insert(*column_name, LuaNil {});
                         continue;
                     }
-
+  
                     match value.type_info().name() {
                         "INT4" | "INT" | "INTEGER" | "MEDIUMINT" => {
                             let v = sqlx::decode::Decode::decode(value).unwrap_or(0i32);
                             row_table.insert(*column_name, v);
                         }
                         "INT4 UNSIGNED" | "INT UNSIGNED" | "INTEGER UNSIGNED" | "MEDIUMINT UNSIGNED" => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0u32);
+                            let v = <u32 as sqlx::Decode<DB>>::decode(value).unwrap_or(0u32);
                             row_table.insert(*column_name, v);
                         }
                         "INT8" | "BIGINT" => {
@@ -581,7 +581,7 @@ where
                             row_table.insert(*column_name, v);
                         }
                         "INT8 UNSIGNED" | "BIGINT UNSIGNED" => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0u64);
+                            let v = <u64 as sqlx::Decode<DB>>::decode(value).unwrap_or(0u64);
                             row_table.insert(*column_name, v);
                         }
                         "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "TINYTEXT"
