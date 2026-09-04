@@ -1053,6 +1053,38 @@ where
     }
 }
 
+fn push_json_value(state: LuaState, value: serde_json::Value) {
+    match value {
+        serde_json::Value::Null => {
+            laux::lua_pushlightuserdata(state, std::ptr::null_mut());
+        }
+        serde_json::Value::Bool(value) => laux::lua_push(state, value),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                laux::lua_push(state, value);
+            } else if let Some(value) = value.as_u64() {
+                laux::lua_push(state, value);
+            } else {
+                laux::lua_push(state, value.as_f64().unwrap_or_default());
+            }
+        }
+        serde_json::Value::String(value) => laux::lua_push(state, value),
+        serde_json::Value::Array(values) => {
+            let table = LuaTable::new(state, values.len(), 0);
+            for (index, value) in values.into_iter().enumerate() {
+                push_json_value(state, value);
+                table.rawseti(index + 1);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            let table = LuaTable::new(state, 0, values.len());
+            for (key, value) in values {
+                table.insert_x(key.as_str(), || push_json_value(state, value));
+            }
+        }
+    }
+}
+
 fn process_pg_array_value(
     state: LuaState,
     row_table: &LuaTable,
@@ -1134,21 +1166,10 @@ fn process_pg_array_value(
         }
         "JSON[]" | "JSONB[]" => {
             let decoded = decode_array!(Json<serde_json::Value>);
-            let decoded: Result<Vec<Option<String>>, String> = decoded
-                .into_iter()
-                .map(|value| {
-                    value
-                        .map(|value| {
-                            serde_json::to_string(&value.0).map_err(|err| {
-                                format!("{} JSON encode error: {}", column_name, err)
-                            })
-                        })
-                        .transpose()
-                })
-                .collect();
-            let decoded = decoded?;
             row_table.insert_x(column_name, || {
-                push_optional_array(state, decoded, laux::lua_push)
+                push_optional_array(state, decoded, |state, value| {
+                    push_json_value(state, value.0)
+                })
             });
         }
         _ => return Ok(false),
@@ -1158,6 +1179,7 @@ fn process_pg_array_value(
 }
 
 fn insert_pg_scalar_value(
+    state: LuaState,
     row_table: &LuaTable,
     column_name: &str,
     db_type: DbType,
@@ -1199,9 +1221,7 @@ fn insert_pg_scalar_value(
         DbType::Bytes => row_table.insert(column_name, decode_value!(&[u8])),
         DbType::Json => {
             let value = decode_value!(serde_json::Value);
-            let json = serde_json::to_string(&value)
-                .map_err(|err| format!("{} JSON encode error: {}", column_name, err))?;
-            row_table.insert(column_name, json)
+            row_table.insert_x(column_name, || push_json_value(state, value))
         }
         DbType::Null => row_table.insert(column_name, LuaNil {}),
         DbType::UnsupportedDecimal => {
@@ -1263,7 +1283,7 @@ fn process_pg_rows(state: LuaState, rows: &[PgRow]) -> Result<i32, String> {
                 continue;
             }
 
-            insert_pg_scalar_value(&row_table, column_name, *db_type, value)?;
+            insert_pg_scalar_value(state, &row_table, column_name, *db_type, value)?;
         }
         table.rawseti(row_index + 1);
     }
