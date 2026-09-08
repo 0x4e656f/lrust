@@ -8,7 +8,7 @@ build = "build.rs"
 [features]
 default = ["excel", "sqlx", "mongodb", "websocket", "http", "json"]
 excel = ["dep:calamine", "dep:csv"]
-sqlx = ["dep:sqlx", "dep:chrono", "dep:phf"]
+sqlx = ["dep:sqlx", "dep:chrono", "dep:phf", "dep:futures", "json"]
 mongodb = ["dep:mongodb", "dep:futures"]
 websocket = ["dep:tokio-tungstenite", "dep:futures", "dep:futures-util"]
 http = ["dep:reqwest", "dep:percent-encoding", "dep:form_urlencoded", "dep:url", "json"]
