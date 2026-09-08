@@ -10,6 +10,7 @@ end
 local pending, calls, logs = {}, {}, {}
 local sequence, break_wait = 0, false
 local registered
+local connect_options
 local moon = {
     id = 42,
     next_sequence = function() sequence = sequence + 1; return sequence end,
@@ -40,8 +41,11 @@ function native:close(ptype, owner, session)
     return session
 end
 local c = {
-    connect = function(ptype, owner, session, _, _, connect_timeout)
+    connect = function(ptype, owner, session, _, _, connect_timeout, request_timeout, max_rows,
+        queue_capacity, reconnect_initial_delay, reconnect_max_delay, reconnect_log_interval)
         assert(ptype == 23 and owner == moon.id)
+        connect_options = table.pack(connect_timeout, request_timeout, max_rows, queue_capacity,
+            reconnect_initial_delay, reconnect_max_delay, reconnect_log_interval)
         if connect_timeout == -1 then error("invalid timeout") end
         pending[session] = native
         return session
@@ -64,6 +68,12 @@ assert(registered.PTYPE == 23 and registered.unpack(99) == 99)
 assert(sqlx.find_connection("missing") == nil)
 local db, err = sqlx.try_connect("postgresql://mock", "exists")
 assert(db and not err)
+assert(connect_options.n == 7 and connect_options[5] == nil)
+assert(sqlx.try_connect("mock", "options", { connect_timeout = 1, request_timeout = 2, max_rows = 3,
+    queue_capacity = 4, reconnect_initial_delay = 0, reconnect_max_delay = 6, reconnect_log_interval = 0 }))
+assert(connect_options.n == 7 and connect_options[1] == 1 and connect_options[2] == 2
+    and connect_options[3] == 3 and connect_options[4] == 4 and connect_options[5] == 0
+    and connect_options[6] == 6 and connect_options[7] == 0, "connect options were not forwarded")
 assert(db:query("SELECT $1, $2", 1, nil).kind == nil)
 assert(calls[#calls].args.n == 3 and calls[#calls].args[3] == nil)
 assert(db:query("invalid").kind == "ERROR")
@@ -231,6 +241,7 @@ assert(#outgoing == previous, "invalid client request was partially sent")
 local function load_service(eager_connect)
     local state = { connections = {}, queries = {}, responses = {}, logs = {}, closed = 0 }
     local mock_moon = {
+        clock = function() return 0 end,
         async = function(fn) fn() end,
         sleep = function() error("unexpected wait in synchronous driver mock") end,
         dispatch = function(protocol, fn) assert(protocol == "lua"); state.dispatch = fn end,
@@ -318,6 +329,201 @@ assert(#lazy.connections == 1)
 lazy.shutdown()
 assert(lazy.quit and lazy.closed == 1)
 print("Driver split regression checks passed: client import, service configuration, 37 exports, routing, dispatch, lazy connect and shutdown")
+
+-- Coroutine-aware response regression: enqueue a second request while the
+-- first is suspended. These are transport/SQLx mocks, not database tests.
+local function check_fault_response(first_result, reject_fallback, fail_log, close_failure)
+    local state = { responses = {}, workers = {}, queries = 0, connects = 0, closes = 0, logs = 0 }
+    local function resume(co)
+        local ok, err = coroutine.resume(co)
+        assert(ok, tostring(err))
+    end
+    local function check_serializable(value, depth)
+        assert(depth <= 32, "serialize can't pack too deep table")
+        if type(value) == "number" then assert(value == value, "serialize can't pack 'nan' number value") end
+        if type(value) == "table" then
+            for k, v in pairs(value) do
+                check_serializable(k, depth + 1)
+                check_serializable(v, depth + 1)
+            end
+        end
+    end
+    local mock_moon = {
+        clock = function() return 0 end,
+        async = function(fn)
+            local co = coroutine.create(fn)
+            state.workers[#state.workers + 1] = co
+            resume(co)
+        end,
+        sleep = function() coroutine.yield("sleep") end,
+        dispatch = function(_, fn) state.dispatch = fn end,
+        shutdown = function(fn) state.shutdown = fn end,
+        quit = function() state.quit = true end,
+        error = function()
+            state.logs = state.logs + 1
+            if fail_log then error("mock log transport unavailable") end
+        end,
+        response = function(_, _, session, result)
+            check_serializable(result, 0)
+            if reject_fallback and session == 1 then error("mock response transport unavailable") end
+            state.responses[session] = result
+        end,
+    }
+    local mock_sqlx = {
+        try_connect = function()
+            state.connects = state.connects + 1
+            return {
+                query = function()
+                    state.queries = state.queries + 1
+                    if state.queries == 1 then
+                        coroutine.yield("query")
+                        return first_result
+                    end
+                    return { { value = 42 } }
+                end,
+                close = function()
+                    state.closes = state.closes + 1
+                    if close_failure then error("mock close failure") end
+                    return true
+                end,
+            }
+        end,
+    }
+    local env = setmetatable({ require = function(name)
+        if name == "moon" then return mock_moon end
+        if name == "ext.sqlx" then return mock_sqlx end
+        if name == "list" then return compile_file(workspace .. "lualib/list.lua")() end
+        error("unexpected require: " .. name)
+    end }, { __index = _G })
+    compile_file(driver_service_path, env)({ name = "fault_mock", url = "postgres://mock", poolsize = 1 })
+    state.dispatch(88, 1, "query", 1, "first")
+    state.dispatch(88, 2, "query", 1, "second")
+    assert(state.queries == 1 and not state.responses[1] and not state.responses[2], "FIFO broken")
+    state.dispatch(88, 3, "stats")
+    local active = state.responses[3].lanes[1]
+    assert(active.running and active.inflight and active.queue == 1)
+    resume(state.workers[1])
+    assert(coroutine.status(state.workers[1]) == "dead")
+    assert(state.queries == 2 and state.responses[2].data[1].value == 42, "response error stalled the lane")
+    if reject_fallback then
+        assert(not state.responses[1] and state.logs > 0)
+    else
+        assert(state.responses[1].code == (first_result.kind or "DRIVER"))
+        if not first_result.kind then
+            assert(state.responses[1].message:find("serialize/send SQLx result", 1, true))
+        end
+    end
+    state.dispatch(88, 4, "stats")
+    local idle = state.responses[4].lanes[1]
+    assert(not idle.running and not idle.inflight and idle.queue == 0, "worker flags were not reset")
+    if first_result.kind then
+        assert(state.connects == 2 and state.closes == 1, "faulted connection was reused")
+    else
+        assert(state.connects == 1 and state.closes == 0, "serialization error discarded a healthy connection")
+    end
+    state.shutdown()
+    assert(state.quit and state.closes == state.connects, "shutdown failed to drain after a response error")
+end
+check_fault_response({ { value = 0 / 0 } })
+local deep = { value = true }
+for _ = 1, 40 do deep = { nested = deep } end
+check_fault_response({ { value = deep } })
+check_fault_response({ { value = 0 / 0 } }, true)
+check_fault_response({ { value = 0 / 0 } }, true, true)
+for _, kind in ipairs({ "TIMEOUT", "SOCKET", "CLOSED" }) do
+    check_fault_response({ kind = kind, message = "mock failure" })
+end
+check_fault_response({ kind = "TIMEOUT", message = "mock failure" }, false, true, true)
+print("Driver fault regression checks passed: NaN/depth, failed fallback/logging, queued FIFO recovery, reconnect without replay and shutdown")
+
+-- Deterministic clock/connection mocks: no real sleep, database or Moon host.
+local function reconnect_service(overrides)
+    local state = { now = 0, connects = 0, queries = 0, closes = 0, logs = {}, responses = {}, offline = true }
+    local mock_moon = {
+        clock = function() return state.now / 1000 end,
+        async = function(fn) fn() end,
+        sleep = function() error("cooldown must fail fast, not sleep") end,
+        dispatch = function(_, fn) state.dispatch = fn end,
+        shutdown = function(fn) state.shutdown = fn end,
+        quit = function() state.quit = true end,
+        response = function(_, _, session, res) state.responses[session] = res end,
+        error = function(message) state.logs[#state.logs + 1] = message end,
+    }
+    local mock_sqlx = { try_connect = function(_, name, options)
+        state.connects = state.connects + 1
+        state.options = options
+        if state.offline and name:sub(-2) == ":1" then
+            return nil, { kind = "DB", message = "mock login failure", sqlstate = "28P01" }
+        end
+        return {
+            query = function()
+                state.queries = state.queries + 1
+                return state.query_error or { { value = 42 } }
+            end,
+            close = function() state.closes = state.closes + 1; return true end,
+        }
+    end }
+    local env = setmetatable({ require = function(name)
+        if name == "moon" then return mock_moon end
+        if name == "ext.sqlx" then return mock_sqlx end
+        if name == "list" then return compile_file(workspace .. "lualib/list.lua")() end
+        error(name)
+    end }, { __index = _G })
+    local conf = { name = "cooldown_mock", url = "postgres://mock", poolsize = 2, eager_connect = false,
+        reconnect_max_delay = 1000 }
+    for k, v in pairs(overrides or {}) do conf[k] = v end
+    compile_file(driver_service_path, env)(conf)
+    function state:request(session, affinity)
+        self.dispatch(88, session or 1, "query", affinity or 0, "SELECT 42")
+        return self.responses[session or 1]
+    end
+    return state
+end
+local retry = reconnect_service()
+local failed = retry:request()
+assert(failed.code == "DB" and failed.sqlstate == "28P01" and failed.connect_failed and failed.retry_after_ms == 250)
+for _ = 1, 100 do retry:request(0) end
+assert(retry.connects == 1 and retry.queries == 0 and #retry.logs == 1)
+retry.now = 249
+assert(retry:request().retry_after_ms == 1 and retry.connects == 1)
+assert(failed.retry_after_ms == 250, "cooldown mutated a previously returned response")
+for _, pair in ipairs({ { 250, 500 }, { 750, 1000 }, { 1750, 1000 } }) do
+    retry.now = pair[1]
+    assert(retry:request().retry_after_ms == pair[2])
+end
+assert(retry.connects == 4 and retry.queries == 0)
+assert(retry:request(1, 1).data[1].value == 42, "another lane was blocked by cooldown")
+retry.now = 5000
+retry:request(0)
+assert(#retry.logs == 2 and retry.logs[2]:find("suppressed connection errors: 99", 1, true))
+retry.now, retry.offline = 6000, false
+assert(retry:request().data[1].value == 42)
+local connections = retry.connects
+retry.query_error = { kind = "SOCKET", message = "native reconnect cooldown", connect_failed = true, retry_after_ms = 100 }
+assert(retry:request().retry_after_ms == 100 and retry.closes == 0)
+retry.query_error = nil
+assert(retry:request().data[1].value == 42 and retry.connects == connections, "native cooldown actor was replaced")
+retry.query_error = { kind = "DB", message = "mock statement error" }
+retry:request(0); retry:request(0)
+assert(#retry.logs == 4, "ordinary SQL errors must not be rate limited")
+retry.query_error = { kind = "SOCKET", message = "mock lost connection" }
+assert(retry:request().code == "SOCKET" and retry.closes == 1)
+retry.query_error, retry.offline = nil, true
+assert(retry:request().retry_after_ms == 250, "successful reconnect did not reset backoff")
+retry.shutdown()
+assert(retry.quit, "shutdown stalled during cooldown")
+local disabled = reconnect_service({ reconnect_initial_delay = 0, reconnect_log_interval = 0,
+    opts = { reconnect_initial_delay = 100, reconnect_log_interval = 100 } })
+for _ = 1, 10 do disabled:request(0) end
+assert(disabled.connects == 10 and #disabled.logs == 10 and disabled.queries == 0)
+assert(disabled.options.reconnect_initial_delay == 0 and disabled.options.reconnect_log_interval == 0)
+for _, conf in ipairs({ { reconnect_initial_delay = -1 }, { reconnect_max_delay = 0 },
+    { reconnect_initial_delay = 1001 }, { reconnect_log_interval = -1 },
+    { reconnect_initial_delay = 0x100000000 }, { reconnect_max_delay = 0x100000000 },
+    { reconnect_log_interval = 0x100000000 } }) do
+    assert(not pcall(reconnect_service, conf), "invalid reconnect configuration was accepted")
+end
+print("Driver reconnect checks passed: fail-fast, exponential cap/reset, independent lanes, error metadata, log throttling, disabled options and shutdown")
 
 if newaction then
     newaction { trigger = "check_sqlx", description = "Check SQLx Lua wrappers", execute = function() end }

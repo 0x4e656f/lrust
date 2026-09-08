@@ -12,12 +12,11 @@ use futures::TryStreamExt;
 use lazy_static::lazy_static;
 use sqlx::types::{Json, Uuid};
 use sqlx::{
-    Column, ColumnIndex, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite, SqlitePool,
-    TypeInfo, ValueRef,
-    migrate::MigrateDatabase,
-    mysql::{MySqlPoolOptions, MySqlRow},
-    postgres::{PgPoolOptions, PgRow, PgValueRef, types::PgTimeTz},
-    sqlite::{SqlitePoolOptions, SqliteRow},
+    Column, ColumnIndex, Connection, Database, Executor, MySql, MySqlConnection, PgConnection,
+    Postgres, Row, Sqlite, SqliteConnection, TypeInfo, ValueRef,
+    mysql::MySqlRow,
+    postgres::{PgRow, PgValueRef, types::PgTimeTz},
+    sqlite::{SqliteConnectOptions, SqliteRow},
     types::chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc},
 };
 use tokio::{
@@ -32,8 +31,11 @@ use lib_lua::{
     lreg, lreg_null, luaL_newlib, push_lua_table,
 };
 
-use crate::lua_json::{JsonOptions, encode_table};
 use crate::{LOG_LEVEL_ERROR, moon_log};
+
+#[path = "sqlx_retry.rs"]
+mod retry;
+use retry::{ConnectionLogGate, ReconnectBackoff};
 
 lazy_static! {
     static ref DATABASE_CONNECTIONS: DashMap<String, DatabaseRegistration> = DashMap::new();
@@ -87,15 +89,19 @@ fn checked_string(state: LuaState, index: i32) -> String {
 }
 
 fn positive_option(state: LuaState, index: i32, default: i64, max: i64) -> i64 {
+    bounded_option(state, index, default, 1, max)
+}
+
+fn bounded_option(state: LuaState, index: i32, default: i64, min: i64, max: i64) -> i64 {
     let value = if unsafe { ffi::lua_isnoneornil(state.as_ptr(), index) } != 0 {
         default
     } else {
         laux::lua_get::<i64>(state, index)
     };
-    if value <= 0 || value > max {
+    if value < min || value > max {
         laux::lua_error(
             state,
-            format!("SQLx option #{index} must be between 1 and {max}"),
+            format!("SQLx option #{index} must be between {min} and {max}"),
         );
     }
     value
@@ -151,13 +157,16 @@ fn push_userdata<T: SqlxUserdata>(state: LuaState, value: T, lib: &[laux::LuaReg
     }
 }
 
-enum DatabasePool {
-    MySql(MySqlPool),
-    Postgres(PgPool),
-    Sqlite(SqlitePool),
+// The FIFO actor exclusively owns a physical connection. Executing via a
+// one-slot Pool adds acquire/release health checks to every operation, and a
+// cancelled query can leave a pool-return task waiting on the old query.
+enum DatabaseBackend {
+    MySql(MySqlConnection),
+    Postgres(PgConnection),
+    Sqlite(SqliteConnection),
 }
 
-impl DatabasePool {
+impl DatabaseBackend {
     async fn connect(database_url: &str, timeout_duration: Duration) -> Result<Self, sqlx::Error> {
         async fn connect_with_timeout<F, T>(
             timeout_duration: Duration,
@@ -174,41 +183,25 @@ impl DatabasePool {
         }
 
         if database_url.starts_with("mysql://") {
-            let pool = connect_with_timeout(
-                timeout_duration,
-                MySqlPoolOptions::new()
-                    .max_connections(1)
-                    .connect(database_url),
-            )
-            .await?;
-            Ok(DatabasePool::MySql(pool))
+            let connection =
+                connect_with_timeout(timeout_duration, MySqlConnection::connect(database_url))
+                    .await?;
+            Ok(Self::MySql(connection))
         } else if database_url.starts_with("postgres://")
             || database_url.starts_with("postgresql://")
         {
-            let pool = connect_with_timeout(
-                timeout_duration,
-                PgPoolOptions::new()
-                    .max_connections(1)
-                    .connect(database_url),
-            )
-            .await?;
-            Ok(DatabasePool::Postgres(pool))
+            let connection =
+                connect_with_timeout(timeout_duration, PgConnection::connect(database_url)).await?;
+            Ok(Self::Postgres(connection))
         } else if database_url.starts_with("sqlite:") {
-            let pool = connect_with_timeout(timeout_duration, async {
-                if !Sqlite::database_exists(database_url).await? {
-                    Sqlite::create_database(database_url).await?;
-                }
-                SqlitePoolOptions::new()
-                    .max_connections(1)
-                    // In-memory databases disappear when their last connection
-                    // is reaped. Keep this actor's connection until close().
-                    .idle_timeout(None)
-                    .max_lifetime(None)
-                    .connect(database_url)
-                    .await
+            let connection = connect_with_timeout(timeout_duration, async {
+                let options = database_url
+                    .parse::<SqliteConnectOptions>()?
+                    .create_if_missing(true);
+                SqliteConnection::connect_with(&options).await
             })
             .await?;
-            Ok(DatabasePool::Sqlite(pool))
+            Ok(Self::Sqlite(connection))
         } else {
             Err(sqlx::Error::Configuration(
                 "Unsupported database type".into(),
@@ -347,48 +340,42 @@ impl DatabasePool {
     }
 
     async fn query(
-        &self,
+        &mut self,
         request: &DatabaseQuery,
         max_rows: usize,
     ) -> Result<DatabaseResponse, sqlx::Error> {
         match self {
-            DatabasePool::MySql(pool) => {
+            Self::MySql(connection) => {
                 let query = Self::make_query(&request.sql, &request.binds)?;
-                let mut stream = query.fetch(pool);
+                let mut stream = query.fetch(connection);
                 let mut rows = Vec::new();
                 while let Some(row) = stream.try_next().await? {
                     if rows.len() >= max_rows {
-                        return Err(sqlx::Error::Configuration(
-                            format!("query result exceeded max_rows ({max_rows})").into(),
-                        ));
+                        return Ok(DatabaseResponse::RowLimitExceeded(max_rows));
                     }
                     rows.push(row);
                 }
                 Ok(DatabaseResponse::MysqlRows(rows))
             }
-            DatabasePool::Postgres(pool) => {
+            Self::Postgres(connection) => {
                 let query = Self::make_pg_query(&request.sql, &request.binds)?;
-                let mut stream = query.fetch(pool);
+                let mut stream = query.fetch(connection);
                 let mut rows = Vec::new();
                 while let Some(row) = stream.try_next().await? {
                     if rows.len() >= max_rows {
-                        return Err(sqlx::Error::Configuration(
-                            format!("query result exceeded max_rows ({max_rows})").into(),
-                        ));
+                        return Ok(DatabaseResponse::RowLimitExceeded(max_rows));
                     }
                     rows.push(row);
                 }
                 Ok(DatabaseResponse::PgRows(rows))
             }
-            DatabasePool::Sqlite(pool) => {
+            Self::Sqlite(connection) => {
                 let query = Self::make_query(&request.sql, &request.binds)?;
-                let mut stream = query.fetch(pool);
+                let mut stream = query.fetch(connection);
                 let mut rows = Vec::new();
                 while let Some(row) = stream.try_next().await? {
                     if rows.len() >= max_rows {
-                        return Err(sqlx::Error::Configuration(
-                            format!("query result exceeded max_rows ({max_rows})").into(),
-                        ));
+                        return Ok(DatabaseResponse::RowLimitExceeded(max_rows));
                     }
                     rows.push(row);
                 }
@@ -397,29 +384,29 @@ impl DatabasePool {
         }
     }
 
-    async fn execute(&self, request: &DatabaseQuery) -> Result<DatabaseResponse, sqlx::Error> {
+    async fn execute(&mut self, request: &DatabaseQuery) -> Result<DatabaseResponse, sqlx::Error> {
         match self {
-            DatabasePool::MySql(pool) => {
+            Self::MySql(connection) => {
                 let result = Self::make_query(&request.sql, &request.binds)?
-                    .execute(pool)
+                    .execute(connection)
                     .await?;
                 Ok(DatabaseResponse::Execute {
                     rows_affected: result.rows_affected(),
                     last_insert_id: Some(result.last_insert_id()),
                 })
             }
-            DatabasePool::Postgres(pool) => {
+            Self::Postgres(connection) => {
                 let result = Self::make_pg_query(&request.sql, &request.binds)?
-                    .execute(pool)
+                    .execute(connection)
                     .await?;
                 Ok(DatabaseResponse::Execute {
                     rows_affected: result.rows_affected(),
                     last_insert_id: None,
                 })
             }
-            DatabasePool::Sqlite(pool) => {
+            Self::Sqlite(connection) => {
                 let result = Self::make_query(&request.sql, &request.binds)?
-                    .execute(pool)
+                    .execute(connection)
                     .await?;
                 Ok(DatabaseResponse::Execute {
                     rows_affected: result.rows_affected(),
@@ -429,24 +416,24 @@ impl DatabasePool {
         }
     }
 
-    async fn batch(&self, sql: &str) -> Result<DatabaseResponse, sqlx::Error> {
+    async fn batch(&mut self, sql: &str) -> Result<DatabaseResponse, sqlx::Error> {
         match self {
-            DatabasePool::MySql(pool) => {
-                let result = sqlx::raw_sql(sql).execute(pool).await?;
+            Self::MySql(connection) => {
+                let result = connection.execute(sqlx::raw_sql(sql)).await?;
                 Ok(DatabaseResponse::Execute {
                     rows_affected: result.rows_affected(),
                     last_insert_id: Some(result.last_insert_id()),
                 })
             }
-            DatabasePool::Postgres(pool) => {
-                let result = sqlx::raw_sql(sql).execute(pool).await?;
+            Self::Postgres(connection) => {
+                let result = connection.execute(sqlx::raw_sql(sql)).await?;
                 Ok(DatabaseResponse::Execute {
                     rows_affected: result.rows_affected(),
                     last_insert_id: None,
                 })
             }
-            DatabasePool::Sqlite(pool) => {
-                let result = sqlx::raw_sql(sql).execute(pool).await?;
+            Self::Sqlite(connection) => {
+                let result = connection.execute(sqlx::raw_sql(sql)).await?;
                 Ok(DatabaseResponse::Execute {
                     rows_affected: result.rows_affected(),
                     last_insert_id: u64::try_from(result.last_insert_rowid()).ok(),
@@ -456,52 +443,111 @@ impl DatabasePool {
     }
 
     async fn transaction(
-        &self,
+        &mut self,
         requests: &[DatabaseQuery],
     ) -> Result<DatabaseResponse, sqlx::Error> {
         match self {
-            DatabasePool::MySql(pool) => {
-                let mut transaction = pool.begin().await?;
-                let mut rows_affected = 0u64;
-                for request in requests {
-                    let query = Self::make_query(&request.sql, &request.binds)?;
-                    rows_affected = rows_affected
-                        .saturating_add(query.execute(&mut *transaction).await?.rows_affected());
+            Self::MySql(connection) => {
+                let mut transaction = connection.begin().await?;
+                let executed = async {
+                    let mut rows_affected = 0u64;
+                    for request in requests {
+                        let query = Self::make_query(&request.sql, &request.binds)?;
+                        rows_affected = rows_affected.saturating_add(
+                            query.execute(&mut *transaction).await?.rows_affected(),
+                        );
+                    }
+                    Ok::<_, sqlx::Error>(rows_affected)
                 }
-                transaction.commit().await?;
+                .await;
+                let rows_affected = match executed {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        // Drop only queues ROLLBACK. Flush and await it before
+                        // reporting failure, or an idle actor would retain locks.
+                        if let Err(error) = transaction.rollback().await {
+                            return Ok(DatabaseResponse::DisconnectedError(error));
+                        }
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = transaction.commit().await {
+                    return Ok(DatabaseResponse::DisconnectedError(error));
+                }
                 Ok(DatabaseResponse::Transaction { rows_affected })
             }
-            DatabasePool::Postgres(pool) => {
-                let mut transaction = pool.begin().await?;
-                let mut rows_affected = 0u64;
-                for request in requests {
-                    let query = Self::make_pg_query(&request.sql, &request.binds)?;
-                    rows_affected = rows_affected
-                        .saturating_add(query.execute(&mut *transaction).await?.rows_affected());
+            Self::Postgres(connection) => {
+                let mut transaction = connection.begin().await?;
+                let executed = async {
+                    let mut rows_affected = 0u64;
+                    for request in requests {
+                        let query = Self::make_pg_query(&request.sql, &request.binds)?;
+                        rows_affected = rows_affected.saturating_add(
+                            query.execute(&mut *transaction).await?.rows_affected(),
+                        );
+                    }
+                    Ok::<_, sqlx::Error>(rows_affected)
                 }
-                transaction.commit().await?;
+                .await;
+                let rows_affected = match executed {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        // Drop only queues ROLLBACK. Flush and await it before
+                        // reporting failure, or an idle actor would retain locks.
+                        if let Err(error) = transaction.rollback().await {
+                            return Ok(DatabaseResponse::DisconnectedError(error));
+                        }
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = transaction.commit().await {
+                    return Ok(DatabaseResponse::DisconnectedError(error));
+                }
                 Ok(DatabaseResponse::Transaction { rows_affected })
             }
-            DatabasePool::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
-                let mut rows_affected = 0u64;
-                for request in requests {
-                    let query = Self::make_query(&request.sql, &request.binds)?;
-                    rows_affected = rows_affected
-                        .saturating_add(query.execute(&mut *transaction).await?.rows_affected());
+            Self::Sqlite(connection) => {
+                let mut transaction = connection.begin().await?;
+                let executed = async {
+                    let mut rows_affected = 0u64;
+                    for request in requests {
+                        let query = Self::make_query(&request.sql, &request.binds)?;
+                        rows_affected = rows_affected.saturating_add(
+                            query.execute(&mut *transaction).await?.rows_affected(),
+                        );
+                    }
+                    Ok::<_, sqlx::Error>(rows_affected)
                 }
-                transaction.commit().await?;
+                .await;
+                let rows_affected = match executed {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        // Drop only queues ROLLBACK. Flush and await it before
+                        // reporting failure, or an idle actor would retain locks.
+                        if let Err(error) = transaction.rollback().await {
+                            return Ok(DatabaseResponse::DisconnectedError(error));
+                        }
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = transaction.commit().await {
+                    return Ok(DatabaseResponse::DisconnectedError(error));
+                }
                 Ok(DatabaseResponse::Transaction { rows_affected })
             }
         }
     }
 
-    async fn close(&self) {
-        match self {
-            DatabasePool::MySql(pool) => pool.close().await,
-            DatabasePool::Postgres(pool) => pool.close().await,
-            DatabasePool::Sqlite(pool) => pool.close().await,
-        }
+    async fn close(self) {
+        // No Pool or detached pool-return tasks survive this future. Dropping
+        // the timed-out close future drops the owned transport as well.
+        let _ = timeout(Duration::from_secs(1), async move {
+            match self {
+                Self::MySql(connection) => connection.close().await,
+                Self::Postgres(connection) => connection.close().await,
+                Self::Sqlite(connection) => connection.close().await,
+            }
+        })
+        .await;
     }
 }
 
@@ -537,10 +583,15 @@ struct DatabaseRegistration {
 struct DatabaseHandlerContext {
     protocol_type: u8,
     connection_name: String,
+    database_url: String,
+    connect_timeout: Duration,
     identity: Arc<()>,
     counter: Arc<AtomicI64>,
     request_timeout: Duration,
     max_rows: usize,
+    reconnect_initial_delay: Duration,
+    reconnect_max_delay: Duration,
+    reconnect_log_interval: Duration,
     closed: watch::Sender<bool>,
 }
 
@@ -551,7 +602,16 @@ enum DatabaseResponse {
     MysqlRows(Vec<MySqlRow>),
     SqliteRows(Vec<SqliteRow>),
     Error(sqlx::Error),
+    ConnectFailed {
+        error: sqlx::Error,
+        retry_after_ms: u64,
+    },
+    ReconnectCooldown(u64),
+    // Preserve the original error metadata while retiring a connection whose
+    // transaction commit/rollback did not complete successfully.
+    DisconnectedError(sqlx::Error),
     Timeout(String),
+    RowLimitExceeded(usize),
     Execute {
         rows_affected: u64,
         last_insert_id: Option<u64>,
@@ -607,25 +667,87 @@ struct DatabaseQuery {
     binds: Vec<QueryParams>,
 }
 
+fn connection_error(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::Protocol(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed
+    )
+}
+
+impl DatabaseResponse {
+    fn requires_disconnect(&self) -> bool {
+        match self {
+            // A cancelled/partially consumed operation must never reuse its
+            // connection or defer draining its result to the next request.
+            Self::Timeout(_) | Self::RowLimitExceeded(_) | Self::DisconnectedError(_) => true,
+            Self::Error(error) => {
+                connection_error(error)
+                    || error
+                        .as_database_error()
+                        .and_then(|error| error.code())
+                        .is_some_and(|code| {
+                            code.starts_with("08")
+                                || matches!(code.as_ref(), "57P01" | "57P02" | "57P03")
+                        })
+            }
+            _ => false,
+        }
+    }
+}
+
 fn finish_request(
     context: &DatabaseHandlerContext,
     owner: u32,
     session: i64,
     response: DatabaseResponse,
+    connection_logs: &mut ConnectionLogGate,
 ) {
     context.counter.fetch_sub(1, Ordering::AcqRel);
 
     if session == 0 {
+        let suppressed = if matches!(
+            response,
+            DatabaseResponse::ConnectFailed { .. } | DatabaseResponse::ReconnectCooldown(_)
+        ) {
+            let Some(count) = connection_logs.take(Instant::now()) else {
+                return;
+            };
+            count
+        } else {
+            0
+        };
         let message = match &response {
-            DatabaseResponse::Error(err) => Some(err.to_string()),
+            DatabaseResponse::Error(err) | DatabaseResponse::DisconnectedError(err) => {
+                Some(err.to_string())
+            }
             DatabaseResponse::Timeout(message) => Some(message.clone()),
+            DatabaseResponse::ConnectFailed {
+                error,
+                retry_after_ms,
+            } => Some(format!(
+                "connection failed: {error}; retry after {retry_after_ms} ms (SQL not submitted)"
+            )),
+            DatabaseResponse::ReconnectCooldown(ms) => Some(format!(
+                "reconnect cooldown: retry after {ms} ms (SQL not submitted)"
+            )),
+            DatabaseResponse::RowLimitExceeded(max_rows) => {
+                Some(format!("query result exceeded max_rows ({max_rows})"))
+            }
             _ => None,
         };
         if let Some(message) = message {
             moon_log(
                 owner,
                 LOG_LEVEL_ERROR,
-                format!("Database '{}' error: {message}", context.connection_name),
+                format!(
+                    "Database '{}' error: {message}; suppressed connection errors: {suppressed}",
+                    context.connection_name
+                ),
             );
         }
         return;
@@ -635,72 +757,99 @@ fn finish_request(
 }
 
 async fn database_handler(
-    pool: &DatabasePool,
+    backend: DatabaseBackend,
     mut rx: mpsc::Receiver<DatabaseRequest>,
     context: DatabaseHandlerContext,
 ) {
+    let mut backend = Some(backend);
+    let mut reconnect =
+        ReconnectBackoff::new(context.reconnect_initial_delay, context.reconnect_max_delay);
+    let mut connection_logs = ConnectionLogGate::new(context.reconnect_log_interval);
     while let Some(op) = rx.recv().await {
-        match op {
-            DatabaseRequest::Query(owner, session, query_op) => {
-                let response = match timeout(
-                    context.request_timeout,
-                    pool.query(&query_op, context.max_rows),
-                )
-                .await
-                {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(err)) => DatabaseResponse::Error(err),
-                    Err(_) => DatabaseResponse::Timeout(format!(
-                        "query timed out after {} ms",
-                        context.request_timeout.as_millis()
-                    )),
-                };
-                finish_request(&context, owner, session, response);
-            }
-            DatabaseRequest::Execute(owner, session, query_op) => {
-                let response = match timeout(context.request_timeout, pool.execute(&query_op)).await
-                {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(err)) => DatabaseResponse::Error(err),
-                    Err(_) => DatabaseResponse::Timeout(format!(
-                        "execute timed out after {} ms",
-                        context.request_timeout.as_millis()
-                    )),
-                };
-                finish_request(&context, owner, session, response);
-            }
-            DatabaseRequest::Batch(owner, session, sql) => {
-                let response = match timeout(context.request_timeout, pool.batch(&sql)).await {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(err)) => DatabaseResponse::Error(err),
-                    Err(_) => DatabaseResponse::Timeout(format!(
-                        "batch timed out after {} ms",
-                        context.request_timeout.as_millis()
-                    )),
-                };
-                finish_request(&context, owner, session, response);
-            }
-            DatabaseRequest::Transaction(owner, session, query_ops) => {
-                let response =
-                    match timeout(context.request_timeout, pool.transaction(&query_ops)).await {
-                        Ok(Ok(response)) => response,
-                        Ok(Err(err)) => DatabaseResponse::Error(err),
-                        Err(_) => DatabaseResponse::Timeout(format!(
-                            "transaction timed out after {} ms",
-                            context.request_timeout.as_millis()
-                        )),
-                    };
-                finish_request(&context, owner, session, response);
-            }
+        let (owner, session, operation) = match &op {
+            DatabaseRequest::Query(owner, session, _) => (*owner, *session, "query"),
+            DatabaseRequest::Execute(owner, session, _) => (*owner, *session, "execute"),
+            DatabaseRequest::Batch(owner, session, _) => (*owner, *session, "batch"),
+            DatabaseRequest::Transaction(owner, session, _) => (*owner, *session, "transaction"),
             DatabaseRequest::Close => {
-                // Prevent any later sends, but still process everything which
-                // raced with close and was already accepted by the channel.
+                // Stop later sends, but drain every already accepted request.
                 rx.close();
+                continue;
             }
+        };
+        let retry_after_ms = reconnect.retry_after_ms(Instant::now());
+        if backend.is_none() && retry_after_ms > 0 {
+            finish_request(
+                &context,
+                owner,
+                session,
+                DatabaseResponse::ReconnectCooldown(retry_after_ms),
+                &mut connection_logs,
+            );
+            continue;
         }
+        // This flag also catches the outer request deadline expiring during
+        // a handshake. Ordinary SQL timeouts must not activate connect backoff.
+        let mut connecting = backend.is_none();
+        let result = timeout(context.request_timeout, async {
+            let connection = match backend {
+                Some(ref mut connection) => connection,
+                None => backend.insert(
+                    DatabaseBackend::connect(&context.database_url, context.connect_timeout)
+                        .await?,
+                ),
+            };
+            connecting = false;
+            reconnect.reset();
+            match &op {
+                DatabaseRequest::Query(_, _, query) => {
+                    connection.query(query, context.max_rows).await
+                }
+                DatabaseRequest::Execute(_, _, query) => connection.execute(query).await,
+                DatabaseRequest::Batch(_, _, sql) => connection.batch(sql).await,
+                DatabaseRequest::Transaction(_, _, queries) => {
+                    connection.transaction(queries).await
+                }
+                DatabaseRequest::Close => unreachable!("close is handled before execution"),
+            }
+        })
+        .await;
+        let response = if connecting {
+            reconnect.failed(Instant::now());
+            let error = match result {
+                Ok(Err(error)) => error,
+                Err(_) => sqlx::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "request timed out while reconnecting",
+                )),
+                Ok(Ok(_)) => unreachable!("successful reconnect clears connecting"),
+            };
+            DatabaseResponse::ConnectFailed {
+                error,
+                retry_after_ms: reconnect.retry_after_ms(Instant::now()),
+            }
+        } else {
+            match result {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => DatabaseResponse::Error(error),
+                Err(_) => DatabaseResponse::Timeout(format!(
+                    "{operation} timed out after {} ms",
+                    context.request_timeout.as_millis(),
+                )),
+            }
+        };
+        if response.requires_disconnect() {
+            // Drop the raw transport without awaiting protocol cleanup. Do not
+            // retry this operation: a lost response may hide a committed write.
+            // Only a later FIFO request may open a new connection.
+            drop(backend.take());
+        }
+        finish_request(&context, owner, session, response, &mut connection_logs);
     }
 
-    pool.close().await;
+    if let Some(backend) = backend {
+        backend.close().await;
+    }
     DATABASE_CONNECTIONS.remove_if(&context.connection_name, |_, current| {
         Arc::ptr_eq(&current.identity, &context.identity)
     });
@@ -720,10 +869,20 @@ extern "C-unwind" fn connect(state: LuaState) -> i32 {
     let request_timeout_ms = positive_option(state, 7, 30000, u32::MAX as i64) as u64;
     let max_rows = positive_option(state, 8, 100000, i32::MAX as i64) as usize;
     let queue_capacity = positive_option(state, 9, 100, i32::MAX as i64) as usize;
+    let reconnect_initial_delay = bounded_option(state, 10, 250, 0, u32::MAX as i64) as u64;
+    let reconnect_max_delay = positive_option(state, 11, 5000, u32::MAX as i64) as u64;
+    let reconnect_log_interval = bounded_option(state, 12, 5000, 0, u32::MAX as i64) as u64;
+    if reconnect_max_delay < reconnect_initial_delay {
+        laux::lua_error(
+            state,
+            "SQLx reconnect_max_delay must be >= reconnect_initial_delay".to_string(),
+        );
+    }
 
     CONTEXT.tokio_runtime.spawn(async move {
-        match DatabasePool::connect(&database_url, Duration::from_millis(connect_timeout)).await {
-            Ok(pool) => {
+        match DatabaseBackend::connect(&database_url, Duration::from_millis(connect_timeout)).await
+        {
+            Ok(backend) => {
                 let (tx, rx) = mpsc::channel(queue_capacity);
                 let counter = Arc::new(AtomicI64::new(0));
                 let identity = Arc::new(());
@@ -759,22 +918,37 @@ extern "C-unwind" fn connect(state: LuaState) -> i32 {
                 );
                 drop(tx);
                 database_handler(
-                    &pool,
+                    backend,
                     rx,
                     DatabaseHandlerContext {
                         protocol_type,
                         connection_name: name,
+                        database_url,
+                        connect_timeout: Duration::from_millis(connect_timeout),
                         identity,
                         counter,
                         request_timeout: Duration::from_millis(request_timeout_ms),
                         max_rows,
+                        reconnect_initial_delay: Duration::from_millis(reconnect_initial_delay),
+                        reconnect_max_delay: Duration::from_millis(reconnect_max_delay),
+                        reconnect_log_interval: Duration::from_millis(reconnect_log_interval),
                         closed: closed_tx,
                     },
                 )
                 .await;
             }
             Err(err) => {
-                send_response(protocol_type, owner, session, DatabaseResponse::Error(err));
+                // Explicit connect is always a single attempt; no global/name
+                // cooldown map. Only an existing actor remembers failures.
+                send_response(
+                    protocol_type,
+                    owner,
+                    session,
+                    DatabaseResponse::ConnectFailed {
+                        error: err,
+                        retry_after_ms: 0,
+                    },
+                );
             }
         };
     });
@@ -808,10 +982,7 @@ fn parse_null_type(type_name: &str) -> Result<NullType, String> {
     }
 }
 
-fn get_typed_query_param(
-    wrapper: &LuaTable,
-    options: &JsonOptions,
-) -> Result<Option<QueryParams>, String> {
+fn get_typed_query_param(wrapper: &LuaTable) -> Result<Option<QueryParams>, String> {
     let kind = {
         let marker = wrapper.rawget("__sqlx_param");
         match &marker.value {
@@ -852,18 +1023,15 @@ fn get_typed_query_param(
         }
         "json" => {
             let field = wrapper.rawget("value");
-            lua_value_to_json(&field.value, options)
+            lua_value_to_json(&field.value, 0)
                 .map(QueryParams::Json)
                 .map(Some)
-                .ok_or_else(|| "sqlx.json value cannot be encoded as JSON".to_string())
         }
         _ => Err(format!("unknown sqlx parameter kind: {kind}")),
     }
 }
 
 fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
-    let options = JsonOptions::default();
-
     let res = match LuaValue::from_stack(state, i) {
         LuaValue::Nil => QueryParams::Null(NullType::Text),
         LuaValue::LightUserData(ptr) if ptr.is_null() => QueryParams::Null(NullType::Text),
@@ -872,7 +1040,7 @@ fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
         LuaValue::Integer(val) => QueryParams::Int(val),
         LuaValue::String(val) => QueryParams::Text(utf8_string(val, "SQL text parameter")?),
         LuaValue::Table(val) => {
-            if let Some(param) = get_typed_query_param(&val, &options)? {
+            if let Some(param) = get_typed_query_param(&val)? {
                 return Ok(param);
             }
 
@@ -881,16 +1049,10 @@ fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
                 matches!(&marker.value, LuaValue::Boolean(true))
             } || val.getmetafield(cstr!("__sqlx_array")).is_some();
             if is_array_wrapper {
-                return get_pg_array_param(&val, &options);
+                return get_pg_array_param(&val);
             }
 
-            let mut buffer = Vec::new();
-            encode_table(&mut buffer, &val, 0, false, &options)
-                .map_err(|err| format!("SQL JSON parameter encode error: {err}"))?;
-            QueryParams::Json(
-                serde_json::from_slice(buffer.as_slice())
-                    .map_err(|err| format!("SQL JSON parameter decode error: {err}"))?,
-            )
+            QueryParams::Json(lua_table_to_json(&val, 0)?)
         }
         _t => {
             return Err(format!(
@@ -934,28 +1096,59 @@ where
     Ok(result)
 }
 
-fn lua_value_to_json(value: &LuaValue<'_>, options: &JsonOptions) -> Option<serde_json::Value> {
+// Build owned JSON while the Lua stack is valid. SQLx performs the only text
+// serialization later, without an intermediate JSON buffer and parsing pass.
+fn lua_value_to_json(value: &LuaValue<'_>, depth: usize) -> Result<serde_json::Value, String> {
     match value {
-        LuaValue::Nil => Some(serde_json::Value::Null),
-        LuaValue::LightUserData(ptr) if ptr.is_null() => Some(serde_json::Value::Null),
-        LuaValue::Boolean(value) => Some(serde_json::Value::Bool(*value)),
-        LuaValue::Integer(value) => Some(serde_json::Value::Number((*value).into())),
-        LuaValue::Number(value) => {
-            serde_json::Number::from_f64(*value).map(serde_json::Value::Number)
+        LuaValue::Nil => Ok(serde_json::Value::Null),
+        LuaValue::LightUserData(ptr) if ptr.is_null() => Ok(serde_json::Value::Null),
+        LuaValue::Boolean(value) => Ok(serde_json::Value::Bool(*value)),
+        LuaValue::Integer(value) => Ok(serde_json::Value::Number((*value).into())),
+        LuaValue::Number(value) => serde_json::Number::from_f64(*value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| "SQL JSON number must be finite".to_string()),
+        LuaValue::String(value) => {
+            utf8_string(value, "SQL JSON string").map(serde_json::Value::String)
         }
-        LuaValue::String(value) => String::from_utf8(value.to_vec())
-            .ok()
-            .map(serde_json::Value::String),
-        LuaValue::Table(value) => {
-            let mut buffer = Vec::new();
-            encode_table(&mut buffer, value, 0, false, options).ok()?;
-            serde_json::from_slice(&buffer).ok()
-        }
-        _ => None,
+        LuaValue::Table(value) => lua_table_to_json(value, depth),
+        _ => Err(format!("SQL JSON unsupported value type: {}", value.name())),
     }
 }
 
-fn get_pg_array_param(wrapper: &LuaTable, options: &JsonOptions) -> Result<QueryParams, String> {
+fn lua_table_to_json(table: &LuaTable, depth: usize) -> Result<serde_json::Value, String> {
+    if depth >= 64 {
+        return Err("SQL JSON table nesting exceeds 64 levels (possibly cyclic)".to_string());
+    }
+    laux::lua_checkstack(table.lua_state(), 6, cstr!("sqlx.json.table"));
+    let (is_array, len) = table.array_len();
+    if is_array {
+        let mut values = Vec::with_capacity(len);
+        for value in table.expected_array_iter(len) {
+            values.push(lua_value_to_json(&value, depth + 1)?);
+        }
+        return Ok(serde_json::Value::Array(values));
+    }
+    let mut values = serde_json::Map::new();
+    for (key, value) in table.iter() {
+        let key = match key {
+            LuaValue::String(key) => utf8_string(key, "SQL JSON object key")?,
+            LuaValue::Integer(key) => key.to_string(),
+            _ => return Err("SQL JSON object keys must be strings or integers".to_string()),
+        };
+        // Match the former parser: stringified duplicate keys keep the last
+        // value in Lua iteration order. Serde safely escapes object keys.
+        values.insert(key, lua_value_to_json(&value, depth + 1)?);
+    }
+    // Preserve SQLx's fixed defaults: empty tables are arrays and sparse array
+    // slots become JSON null, independent of the public JSON module's options.
+    if values.is_empty() {
+        Ok(serde_json::Value::Array(Vec::new()))
+    } else {
+        Ok(serde_json::Value::Object(values))
+    }
+}
+
+fn get_pg_array_param(wrapper: &LuaTable) -> Result<QueryParams, String> {
     let type_name = {
         let field = wrapper.rawget("type");
         match &field.value {
@@ -1048,7 +1241,7 @@ fn get_pg_array_param(wrapper: &LuaTable, options: &JsonOptions) -> Result<Query
         )?)),
         "json" | "jsonb" => {
             let values = collect_pg_array(values, "a JSON value", |value| {
-                lua_value_to_json(&value, options).map(Json)
+                lua_value_to_json(&value, 0).ok().map(Json)
             })?;
             Ok(QueryParams::PgJsonArray(values))
         }
@@ -1992,39 +2185,68 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
                 "message" => message
             );
         }
-        DatabaseResponse::Error(err) => match err.as_database_error() {
-            Some(db_err) => {
-                let table = LuaTable::new(state, 0, 6);
-                table.insert("kind", "DB");
-                table.insert("message", db_err.message());
-                table.insert("error_kind", format!("{:?}", db_err.kind()));
-                if let Some(code) = db_err.code() {
-                    table.insert("sqlstate", code.as_ref());
+        DatabaseResponse::RowLimitExceeded(max_rows) => {
+            push_lua_table!(state,
+                "kind" => "ERROR",
+                "message" => format!("query result exceeded max_rows ({max_rows})")
+            );
+        }
+        DatabaseResponse::ReconnectCooldown(ms) => {
+            push_lua_table!(state,
+                "kind" => "SOCKET",
+                "message" => "SQLx reconnect cooldown; SQL was not submitted",
+                "connect_failed" => true,
+                "retry_after_ms" => ms
+            );
+        }
+        response @ (DatabaseResponse::Error(_)
+        | DatabaseResponse::DisconnectedError(_)
+        | DatabaseResponse::ConnectFailed { .. }) => {
+            let (err, retry_after_ms) = match response {
+                DatabaseResponse::ConnectFailed {
+                    error,
+                    retry_after_ms,
+                } => (error, Some(retry_after_ms)),
+                DatabaseResponse::Error(error) | DatabaseResponse::DisconnectedError(error) => {
+                    (error, None)
                 }
-                if let Some(constraint) = db_err.constraint() {
-                    table.insert("constraint", constraint);
+                _ => unreachable!(),
+            };
+            match err.as_database_error() {
+                Some(db_err) => {
+                    let table = LuaTable::new(state, 0, 6);
+                    table.insert("kind", "DB");
+                    table.insert("message", db_err.message());
+                    table.insert("error_kind", format!("{:?}", db_err.kind()));
+                    if let Some(code) = db_err.code() {
+                        table.insert("sqlstate", code.as_ref());
+                    }
+                    if let Some(constraint) = db_err.constraint() {
+                        table.insert("constraint", constraint);
+                    }
+                    if let Some(table_name) = db_err.table() {
+                        table.insert("table", table_name);
+                    }
                 }
-                if let Some(table_name) = db_err.table() {
-                    table.insert("table", table_name);
+                None => {
+                    let kind = if connection_error(&err) {
+                        "SOCKET"
+                    } else {
+                        "ERROR"
+                    };
+                    push_lua_table!(
+                        state,
+                        "kind" => kind,
+                        "message" => err.to_string()
+                    );
                 }
             }
-            None => {
-                let kind = match &err {
-                    sqlx::Error::Io(_)
-                    | sqlx::Error::Tls(_)
-                    | sqlx::Error::Protocol(_)
-                    | sqlx::Error::PoolTimedOut
-                    | sqlx::Error::PoolClosed
-                    | sqlx::Error::WorkerCrashed => "SOCKET",
-                    _ => "ERROR",
-                };
-                push_lua_table!(
-                    state,
-                    "kind" => kind,
-                    "message" => err.to_string()
-                );
+            if let Some(ms) = retry_after_ms {
+                let table = LuaTable::from_stack(state, -1);
+                table.insert("connect_failed", true);
+                table.insert("retry_after_ms", ms);
             }
-        },
+        }
     }
 
     1

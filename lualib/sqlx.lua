@@ -1,6 +1,9 @@
 --- SQLx 的 Moon 协程包装层，通过 require("ext.sqlx") 使用；本模块不是独立服务。
 --- sqlx.connect/try_connect 创建连接，返回的 db 使用冒号调用 query/execute/transaction/close。
 --- 每个命名连接只有一条 FIFO 执行队列，按请求实际入队顺序串行处理；不会自动重放 SQL。
+--- 正常请求复用专用物理连接和语句缓存，不逐请求取还连接；超时/断线/行数超限后丢弃旧连接。
+--- 故障后的下一条请求才重建连接；会话设置、临时表等不会恢复，SQLite 内存库也可能丢失。
+--- 客户端超时/断线不保证数据库端 SQL 已停止，不能据此保证跨故障的业务执行顺序。
 --- 需要连接池或按业务 key 保序时使用 lrust_sqldriver.client，不要跨服务传递 db 对象。
 --- 标有 @async 的接口需要在允许挂起的 Moon 协程中调用；等待数据库不会阻塞整个工作线程。
 --- query/execute_wait/batch/transaction 失败返回带 kind/message 的错误表，不是 nil, err。
@@ -80,13 +83,18 @@ moon.register_protocol {
 
 ---@class SqlXConnectOptions
 ---@field connect_timeout? integer 建立连接超时，毫秒，默认 5000，必须大于 0。
----@field request_timeout? integer 单个请求开始执行后的超时，毫秒，默认 30000；不含排队时间。
+---@field request_timeout? integer 单个请求开始执行后的超时，毫秒，默认 30000；含必要重连，不含排队时间。
 ---@field max_rows? integer 单次 query 最大返回行数，默认 100000；不是字节数限制。
 ---@field queue_capacity? integer Rust 连接待执行队列容量，默认 100；不含正在执行的请求。
+---@field reconnect_initial_delay? integer 已有连接重建失败后的首次冷却毫秒数，默认 250；0 禁用退避。
+---@field reconnect_max_delay? integer 连续建连失败的最大冷却毫秒数，默认 5000；正整数且不小于 reconnect_initial_delay。
+---@field reconnect_log_interval? integer 不等待调用的建连失败日志间隔，毫秒，默认 5000；0 不限速，不影响普通 SQL 错误。
 
 ---@alias SqlXErrorKind 'ERROR'|'DB'|'SOCKET'|'TIMEOUT'|'BUSY'|'CLOSED'
 
 ---@class SqlXError
+---@field connect_failed? boolean true 表示本次在建连/冷却阶段失败，未提交 SQL；显式 connect 失败也设置此字段。
+---@field retry_after_ms? integer 建连冷却的剩余毫秒数；仅为本连接的建议，不代表数据库已恢复，不会自动重试。
 ---@field kind SqlXErrorKind 错误类别；TIMEOUT/SOCKET 不代表写入一定没有提交。
 ---@field message string 错误说明。
 ---@field error_kind? string 数据库约束等错误分类（例如 UniqueViolation）。
@@ -227,6 +235,8 @@ end
 --- nil/json.null 编码成 JSON null；需要数据库 SQL NULL 时使用 sqlx.null("jsonb")。
 --- table 在提交 SQL 时才编码，不会在构造包装器时深拷贝；编码失败由执行接口报告。
 --- 普通 table 参数默认也按 JSON 处理；本函数尤其适用于标量和 JSON null。
+--- SQLx 直接构造 JSON 值后编码一次；空 table 为 []，对象键限 UTF-8 字符串/整数，数值必须有限。
+--- table 最多嵌套 64 层；循环表、非法键值在提交阶段报错，不会默默丢弃。
 --- 用法：db:query("SELECT $1::JSONB AS value", sqlx.json({ enabled = true }))。
 ---@param value SqlXJsonValue 待编码的 Lua 值；数值需能表示为合法 JSON 数字。
 ---@return SqlXJsonParam param JSON/JSONB 绑定参数。
@@ -274,6 +284,8 @@ end
 --- 默认：连接超时 5000ms、执行超时 30000ms、查询上限 100000 行、等待队列容量 100。
 --- request_timeout 只计算请求开始执行后的耗时，不含排队；队列满时提交请求返回 BUSY。
 --- 成功返回 db；连接/参数错误返回 nil, err，不在本函数中重试。
+--- 已有 db 内部重建失败后按 250/500/1000/.../5000ms 退避，冷却请求直接失败且不提交 SQL。
+--- 显式 try_connect 每次仍只尝试一次，不共享全局退避；调用方主动重复建连需自行控制频率。
 ---@async
 ---@param database_url string mysql://、postgres://、postgresql:// 或 sqlite: URL。
 ---@param name string 进程内共享连接名；不同独立连接应使用不同名称。
@@ -285,11 +297,17 @@ function M.try_connect(database_url, name, options)
     local request_timeout
     local max_rows
     local queue_capacity
+    local reconnect_initial_delay
+    local reconnect_max_delay
+    local reconnect_log_interval
     if type(options) == "table" then
         connect_timeout = options.connect_timeout
         request_timeout = options.request_timeout
         max_rows = options.max_rows
         queue_capacity = options.queue_capacity
+        reconnect_initial_delay = options.reconnect_initial_delay
+        reconnect_max_delay = options.reconnect_max_delay
+        reconnect_log_interval = options.reconnect_log_interval
     else
         connect_timeout = options
     end
@@ -303,7 +321,10 @@ function M.try_connect(database_url, name, options)
         connect_timeout,
         request_timeout,
         max_rows,
-        queue_capacity)
+        queue_capacity,
+        reconnect_initial_delay,
+        reconnect_max_delay,
+        reconnect_log_interval)
     if not ok then
         return nil, failure("ERROR", session)
     end
@@ -364,6 +385,7 @@ end
 --- 关闭的是共享连接，而不只是当前包装对象；其他持有者之后提交请求也会得到 CLOSED。
 --- 成功后清空当前 obj；本对象再次 close 立即返回 true，其他共享对象重复关闭也安全。
 --- 关闭不会撤销已经提交的 SQL；不能用它代替事务回滚。
+--- 排空后的正常协议关闭最多等待 1 秒，超时即丢弃底层连接；故障连接已在返回错误前丢弃。
 --- 失败或等待中断返回 nil, err，保留当前句柄供再次等待关闭；不保证底层仍能接受请求。
 --- close 没有单独的总等待超时；等待排空可能超过单个请求的 request_timeout。
 ---@async
@@ -431,6 +453,7 @@ end
 --- 成功直接返回行数组，不套 data 字段；没有记录时为 {}。失败返回 SqlXError，先检查 result.kind。
 --- 每行以列名为键；重复列名会报解码错误，应使用 AS 区分；SQL NULL 字段保留为 json.null。
 --- 查询超过 max_rows 时返回错误，不返回截断的部分行；大结果集应自行分页。
+--- 超限会丢弃未读完结果的连接；下一条请求重连，会话设置及临时表不会保留。
 --- PG 普通整数/浮点数/字符串参数分别按 INT8/FLOAT8/TEXT 绑定，日期文本可用 $1::TEXT::DATE。
 --- 当前 NUMERIC/DECIMAL/MONEY 非 NULL 值尚不支持原生解码，需显式 ::TEXT；并未自动转成字符串。
 --- SUM(bigint) 等返回 NUMERIC 的表达式也受此限制；确认不溢出时可对结果显式 ::BIGINT。
@@ -476,6 +499,8 @@ end
 --- 将语句序列作为一个队列请求，在同一连接的一个数据库事务中依次执行并等待提交。
 --- 由接口管理开始/提交/回滚，不要在列表中手动混入 BEGIN/COMMIT/ROLLBACK。
 --- SQL 执行失败会回滚该事务；超时/断线，尤其发生在提交阶段时，最终结果可能不确定。
+--- 普通语句错误会等待显式回滚完成再返回；回滚也受本次 request_timeout 约束。
+--- COMMIT/ROLLBACK 自身失败时丢弃连接，保留错误元数据；下一条请求重连。
 --- 每条语句独立绑定参数，PG 的 $1 从该语句重新编号；整个事务共用一次 request_timeout。
 --- 语句格式为 {sql, param1, ...}；有尾部 nil 时使用 table.pack(sql, ...) 保留总长度 n。
 --- 外层列表必须无空洞；构建失败不提交任何语句。允许空列表，成功的 rows_affected 为 0。
