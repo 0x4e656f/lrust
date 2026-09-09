@@ -1,0 +1,30 @@
+[package]
+name = "sqlx-native-check"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone test workspace: no Moon import library or lrust host is linked.
+[workspace]
+
+[features]
+default = ["sqlx"]
+sqlx = []
+
+[[test]]
+name = "sqlx_native_check"
+path = "../sqlx_native_check.rs"
+
+[dependencies]
+lib-lua = { package = "lib-lua-sys", path = "../../crates/libs/lib-lua-sys", features = ["lua54"] }
+chrono = "0.4"
+dashmap = "6.1.0"
+futures = "0.3"
+lazy_static = "1.5.0"
+phf = { version = "0.13", features = ["macros"] }
+serde_json = "1.0"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "mysql", "chrono", "uuid"] }
+tokio = { version = "1", features = ["full"] }
+
+[build-dependencies]
+cc = "1"

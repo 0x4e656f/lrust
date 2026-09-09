@@ -9,6 +9,15 @@ local function compile_file(filename, environment)
 end
 local pending, calls, logs = {}, {}, {}
 local sequence, break_wait = 0, false
+local guards_created, guards_closed = 0, 0
+local function guard(session)
+    if session == 0 then return nil end
+    guards_created = guards_created + 1
+    return setmetatable({}, { __close = function()
+        guards_closed = guards_closed + 1
+        pending[session] = nil
+    end })
+end
 local registered
 local connect_options
 local moon = {
@@ -32,13 +41,13 @@ for _, method in ipairs({ "query", "execute", "transaction", "batch" }) do
         calls[#calls + 1] = { method = method, args = table.pack(...) }
         if method == "query" and (...) == "invalid" then error("invalid parameter") end
         pending[session] = method == "query" and {} or { rows_affected = 2 }
-        return session
+        return session, guard(session)
     end
 end
 function native:close(ptype, owner, session)
     assert(ptype == 23 and owner == moon.id)
     pending[session] = true
-    return session
+    return session, guard(session)
 end
 local c = {
     connect = function(ptype, owner, session, _, _, connect_timeout, request_timeout, max_rows,
@@ -48,13 +57,20 @@ local c = {
             reconnect_initial_delay, reconnect_max_delay, reconnect_log_interval)
         if connect_timeout == -1 then error("invalid timeout") end
         pending[session] = native
-        return session
+        return session, guard(session)
     end,
-    find_connection = function(name) return name == "exists" and native or nil end,
+    find_connection = function(name)
+        if type(name) ~= "string" then return { kind = "ERROR", message = "name must be a string" } end
+        return name == "exists" and native or nil
+    end,
     decode = function(token, owner) assert(owner == moon.id); return token end,
+    response_stats = function() return { waiting = 0, ready = 0 } end,
     make_transaction = function()
         local trans = { statements = {} }
-        function trans:push(...) self.statements[#self.statements + 1] = table.pack(...) end
+        function trans:push(...)
+            if (...) == "invalid-bind" then return { kind = "ERROR", message = "invalid bind" } end
+            self.statements[#self.statements + 1] = table.pack(...)
+        end
         return trans
     end,
 }
@@ -66,6 +82,7 @@ end }, { __index = _G })
 local sqlx = compile_file(root .. "lualib/sqlx.lua", env)()
 assert(registered.PTYPE == 23 and registered.unpack(99) == 99)
 assert(sqlx.find_connection("missing") == nil)
+assert(not pcall(sqlx.find_connection, {}), "invalid lookup must not produce a fake connection")
 local db, err = sqlx.try_connect("postgresql://mock", "exists")
 assert(db and not err)
 assert(connect_options.n == 7 and connect_options[5] == nil)
@@ -87,6 +104,8 @@ assert(trans.statements[1].n == 3 and trans.statements[1][3] == nil)
 local before = #calls
 assert(db:transaction({ [1] = { "SELECT 1" }, [3] = { "SELECT 3" } }).kind == "ERROR")
 assert(#calls == before, "sparse transaction must not be partially submitted")
+assert(db:transaction({ { "SELECT 1" }, { "invalid-bind" } }).kind == "ERROR")
+assert(#calls == before, "native Result error must not submit a partial transaction")
 local bad, baderr = sqlx.try_connect("mock", "bad", -1)
 assert(bad == nil and baderr.kind == "ERROR")
 break_wait = true
@@ -97,6 +116,8 @@ local closed, closeerr = db:close()
 assert(closed == nil and closeerr.kind == "ERROR" and db.obj ~= nil)
 assert(db:close() == true and db:close() == true)
 assert(db:query("SELECT 1").kind == "CLOSED")
+assert(guards_created == guards_closed, "response leases must close on success and interrupted waits")
+assert(sqlx.response_stats().ready == 0)
 db:execute("UPDATE mock")
 assert(#logs == 1)
 assert(sqlx.null("int8").__sqlx_param == "null")

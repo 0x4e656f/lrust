@@ -1,12 +1,11 @@
 use std::collections::HashSet;
 use std::ffi::CStr;
 use std::sync::{
-    Arc, Once,
-    atomic::{AtomicBool, AtomicI64, AtomicIsize, Ordering},
+    Arc,
+    atomic::{AtomicBool, AtomicI64, Ordering},
 };
 use std::time::{Duration, Instant};
 
-use chrono::SecondsFormat;
 use dashmap::DashMap;
 use futures::TryStreamExt;
 use lazy_static::lazy_static;
@@ -15,7 +14,7 @@ use sqlx::{
     Column, ColumnIndex, Connection, Database, Executor, MySql, MySqlConnection, PgConnection,
     Postgres, Row, Sqlite, SqliteConnection, TypeInfo, ValueRef,
     mysql::MySqlRow,
-    postgres::{PgRow, PgValueRef, types::PgTimeTz},
+    postgres::{PgRow, PgValueFormat, PgValueRef, types::PgTimeTz},
     sqlite::{SqliteConnectOptions, SqliteRow},
     types::chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc},
 };
@@ -28,7 +27,7 @@ use lib_core::context::CONTEXT;
 use lib_lua::{
     self, cstr, ffi, laux,
     laux::{LuaArgs, LuaState, LuaTable, LuaValue},
-    lreg, lreg_null, luaL_newlib, push_lua_table,
+    lreg, lreg_null, luaL_newlib,
 };
 
 use crate::{LOG_LEVEL_ERROR, moon_log};
@@ -37,123 +36,219 @@ use crate::{LOG_LEVEL_ERROR, moon_log};
 mod retry;
 use retry::{ConnectionLogGate, ReconnectBackoff};
 
+#[path = "sqlx_lua.rs"]
+mod lua_safe;
+#[path = "sqlx_pg_datetime.rs"]
+mod pg_datetime;
+#[path = "sqlx_response.rs"]
+mod response;
+use lua_safe::{OutputTable, TableRead};
+
+// SQLx must not use the common unprotected Lua output helpers while Rust owns
+// requests, rows or errors. Keep the error-table macro local for the same reason.
+macro_rules! push_lua_table {
+    ($state:expr, $( $key:expr => $value:expr ),* ) => {{
+        let table = OutputTable::new($state, 0, 6);
+        $(table.insert($key, $value);)*
+    }};
+}
+
 lazy_static! {
     static ref DATABASE_CONNECTIONS: DashMap<String, DatabaseRegistration> = DashMap::new();
-    static ref PENDING_RESPONSES: DashMap<isize, PendingResponse> = DashMap::new();
+    static ref RESPONSES: Arc<response::Registry<DatabaseResponse>> =
+        Arc::new(response::Registry::new());
 }
 
-struct PendingResponse {
-    created_at: Instant,
-    owner: u32,
-    value: DatabaseResponse,
-}
-
-static RESPONSE_ID: AtomicIsize = AtomicIsize::new(1);
-static START_RESPONSE_REAPER: Once = Once::new();
-
-// SQLx owns these tokens. Other lrust modules keep their original transport,
-// and the host's existing void-returning ABI remains unchanged.
+// The lease returned with each async submission owns the reply. Its __close
+// and __gc abandon it immediately; a late completion never retains row buffers.
+// Session IDs are opaque tokens scoped by owner. The Moon host ABI is unchanged.
 fn send_response(protocol_type: u8, owner: u32, session: i64, value: DatabaseResponse) {
-    if session == 0 {
+    if session == 0 || !RESPONSES.publish((owner, session), value) {
         return;
     }
-    START_RESPONSE_REAPER.call_once(|| {
-        CONTEXT.tokio_runtime.spawn(async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                // The host cannot report dropped integer messages. Reclaim
-                // results whose Lua service has exited or abandoned its wait.
-                PENDING_RESPONSES
-                    .retain(|_, response| response.created_at.elapsed() < Duration::from_secs(300));
-            }
-        });
-    });
-    let response_id = RESPONSE_ID.fetch_add(1, Ordering::Relaxed);
-    PENDING_RESPONSES.insert(
-        response_id,
-        PendingResponse {
-            created_at: Instant::now(),
-            owner,
-            value,
-        },
-    );
     unsafe extern "C-unwind" {
         fn send_integer_message(type_: u8, receiver: u32, session: i64, val: isize);
     }
-    unsafe { send_integer_message(protocol_type, owner, session, response_id) };
+    unsafe { send_integer_message(protocol_type, owner, session, session as isize) };
 }
 
-fn checked_string(state: LuaState, index: i32) -> String {
-    let bytes = laux::lua_get::<&[u8]>(state, index);
-    utf8_string(bytes, "SQLx string").unwrap_or_else(|error| laux::lua_error(state, error))
+type LuaResult = Result<i32, String>;
+
+fn run_entry(state: LuaState, entry: fn(LuaState) -> LuaResult) -> i32 {
+    let top = laux::lua_top(state);
+    // Do this before acquiring any Rust-owned request resources. Parameter JSON
+    // depth is already limited to 64; this reserves its bounded traversal stack.
+    laux::lua_checkstack(state, 512, cstr!("sqlx entry"));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match entry(state) {
+        Ok(results) => results,
+        Err(error) => {
+            unsafe {
+                ffi::lua_settop(state.as_ptr(), top);
+            }
+            push_lua_table!(state, "kind" => "ERROR", "message" => error);
+            1
+        }
+    }));
+    let outcome = match outcome {
+        Err(payload) if !payload.is::<lua_safe::LuaFailure>() => {
+            drop(payload);
+            unsafe {
+                ffi::lua_settop(state.as_ptr(), top);
+            }
+            // Rendering a Rust error can itself exhaust the Lua allocator.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                push_lua_table!(state,
+                    "kind" => "ERROR",
+                    "message" => "SQLx internal panic; request was not replayed, write outcome may be unknown"
+                );
+                1
+            }))
+        }
+        outcome => outcome,
+    };
+    match outcome {
+        Ok(results) => results,
+        Err(payload) => {
+            let on_stack = payload
+                .downcast_ref::<lua_safe::LuaFailure>()
+                .is_some_and(|failure| failure.error_on_stack);
+            drop(payload);
+            // All Rust resources (including the panic box) have now dropped.
+            // The original Lua memory-error object preserves LUA_ERRMEM.
+            unsafe {
+                if !on_stack {
+                    ffi::lua_pushstring(state.as_ptr(), c"SQLx Lua stack exhausted".as_ptr());
+                }
+                ffi::lua_error(state.as_ptr())
+            }
+        }
+    }
 }
 
-fn positive_option(state: LuaState, index: i32, default: i64, max: i64) -> i64 {
+macro_rules! entry_points {
+    ($($name:ident => $implementation:ident),* $(,)?) => {
+        $(extern "C-unwind" fn $name(state: LuaState) -> i32 {
+            run_entry(state, $implementation)
+        })*
+    };
+}
+
+entry_points! {
+    connect => connect_impl, query => query_impl, execute => execute_impl,
+    batch => batch_impl, transaction => transaction_impl, close => close_impl,
+    make_transaction => make_transaction_impl, push_transaction_query => push_transaction_query_impl,
+    find_connection => find_connection_impl, decode => decode_impl, stats => stats_impl,
+    response_stats => response_stats_impl,
+}
+
+// Checked Lua APIs longjmp over Rust destructors on Linux. Validate with the
+// non-throwing APIs and propagate Result until all request-owned values drop.
+fn checked_integer<T: TryFrom<i64>>(state: LuaState, index: i32) -> Result<T, String> {
+    let mut valid = 0;
+    let value = unsafe { ffi::lua_tointegerx(state.as_ptr(), index, &mut valid) };
+    if valid == 0 {
+        return Err(format!("SQLx argument #{index} must be an integer"));
+    }
+    T::try_from(value).map_err(|_| format!("SQLx argument #{index} is out of range"))
+}
+
+fn checked_string(state: LuaState, index: i32) -> Result<String, String> {
+    if unsafe { ffi::lua_type(state.as_ptr(), index) } != ffi::LUA_TSTRING {
+        return Err(format!("SQLx argument #{index} must be a string"));
+    }
+    let bytes = laux::lua_to::<&[u8]>(state, index);
+    utf8_string(bytes, "SQLx string")
+}
+
+fn positive_option(state: LuaState, index: i32, default: i64, max: i64) -> Result<i64, String> {
     bounded_option(state, index, default, 1, max)
 }
 
-fn bounded_option(state: LuaState, index: i32, default: i64, min: i64, max: i64) -> i64 {
+fn bounded_option(
+    state: LuaState,
+    index: i32,
+    default: i64,
+    min: i64,
+    max: i64,
+) -> Result<i64, String> {
     let value = if unsafe { ffi::lua_isnoneornil(state.as_ptr(), index) } != 0 {
         default
     } else {
-        laux::lua_get::<i64>(state, index)
+        checked_integer::<i64>(state, index)?
     };
     if value < min || value > max {
-        laux::lua_error(
-            state,
-            format!("SQLx option #{index} must be between {min} and {max}"),
-        );
+        return Err(format!(
+            "SQLx option #{index} must be between {min} and {max}"
+        ));
     }
-    value
+    Ok(value)
 }
 
 trait SqlxUserdata {
     const METATABLE: &'static CStr;
+    const CLOSE: bool = false;
+    fn metatable_key() -> *const std::ffi::c_void;
 }
 
 // Validate type and size before any cast; a Lua caller can pass another
 // userdata to a method. Option also makes repeated __gc calls harmless.
-fn userdata_ptr<T: SqlxUserdata>(state: LuaState, index: i32) -> *mut Option<T> {
-    unsafe {
-        let ptr = ffi::luaL_checkudata(state.as_ptr(), index, T::METATABLE.as_ptr());
-        if ffi::lua_rawlen(state.as_ptr(), index) != std::mem::size_of::<Option<T>>() {
-            laux::lua_error(state, "invalid SQLx userdata size".to_string());
-        }
-        ptr.cast()
-    }
+fn userdata_ptr<T: SqlxUserdata>(state: LuaState, index: i32) -> Result<*mut Option<T>, String> {
+    unsafe { lua_safe::test_userdata::<T>(state, index) }
+        .ok_or_else(|| "invalid SQLx userdata type or size".to_string())
 }
 
-fn connection_arg(state: LuaState, index: i32) -> DatabaseConnection {
-    unsafe { &*userdata_ptr::<DatabaseConnection>(state, index) }
+fn connection_arg(state: LuaState, index: i32) -> Result<DatabaseConnection, String> {
+    unsafe { &*userdata_ptr::<DatabaseConnection>(state, index)? }
         .as_ref()
         .cloned()
-        .unwrap_or_else(|| laux::lua_error(state, "SQLx connection has been collected".to_string()))
+        .ok_or_else(|| "SQLx connection has been collected".to_string())
 }
 
 fn push_userdata<T: SqlxUserdata>(state: LuaState, value: T, lib: &[laux::LuaReg]) {
-    extern "C-unwind" fn gc<T: SqlxUserdata>(state: *mut ffi::lua_State) -> i32 {
-        unsafe {
-            let ptr = ffi::luaL_testudata(state, 1, T::METATABLE.as_ptr());
-            if !ptr.is_null() && ffi::lua_rawlen(state, 1) == std::mem::size_of::<Option<T>>() {
-                (*ptr.cast::<Option<T>>()).take();
-            }
-        }
-        0
+    lua_safe::userdata(state, value, lib);
+}
+
+impl SqlxUserdata for response::Lease<DatabaseResponse> {
+    const METATABLE: &'static CStr = c"sqlx_response_lease";
+    const CLOSE: bool = true;
+    fn metatable_key() -> *const std::ffi::c_void {
+        static KEY: u8 = 0;
+        (&KEY as *const u8).cast()
     }
-    laux::lua_checkstack(state, 4, std::ptr::null());
-    unsafe {
-        let ptr = ffi::lua_newuserdatauv(state.as_ptr(), std::mem::size_of::<Option<T>>(), 0);
-        ptr.cast::<Option<T>>().write(Some(value));
-        if ffi::luaL_newmetatable(state.as_ptr(), T::METATABLE.as_ptr()) != 0 {
-            ffi::lua_createtable(state.as_ptr(), 0, lib.len() as i32);
-            ffi::luaL_setfuncs(state.as_ptr(), lib.as_ptr().cast(), 0);
-            ffi::lua_setfield(state.as_ptr(), -2, cstr!("__index"));
-            ffi::lua_pushcfunction(state.as_ptr(), gc::<T>);
-            ffi::lua_setfield(state.as_ptr(), -2, cstr!("__gc"));
-            ffi::lua_pushboolean(state.as_ptr(), 0);
-            ffi::lua_setfield(state.as_ptr(), -2, cstr!("__metatable"));
+}
+
+fn response_guard(state: LuaState, owner: u32, session: i64) -> Result<Option<i32>, String> {
+    if session == 0 {
+        return Ok(None);
+    }
+    if session < 0 || isize::try_from(session).is_err() {
+        return Err("SQLx session must be a positive native integer".to_string());
+    }
+    let lease = RESPONSES.register((owner, session))?;
+    push_userdata(state, lease, &[lreg_null!()]);
+    Ok(Some(laux::lua_top(state)))
+}
+
+fn return_session(state: LuaState, session: i64, guard: Option<i32>) -> LuaResult {
+    lua_safe::push(state, session);
+    if let Some(index) = guard {
+        unsafe {
+            ffi::lua_pushvalue(state.as_ptr(), index);
         }
-        ffi::lua_setmetatable(state.as_ptr(), -2);
+        Ok(2)
+    } else {
+        Ok(1)
+    }
+}
+
+fn abandon_guard(state: LuaState, guard: Option<i32>) {
+    if let Some(index) = guard {
+        // This is our own freshly created userdata, not a caller-provided cast.
+        unsafe {
+            let ptr = ffi::lua_touserdata(state.as_ptr(), index)
+                .cast::<Option<response::Lease<DatabaseResponse>>>();
+            (*ptr).take();
+        }
     }
 }
 
@@ -569,6 +664,10 @@ struct DatabaseConnection {
 
 impl SqlxUserdata for DatabaseConnection {
     const METATABLE: &'static CStr = c"sqlx_connection_metatable";
+    fn metatable_key() -> *const std::ffi::c_void {
+        static KEY: u8 = 0;
+        (&KEY as *const u8).cast()
+    }
 }
 
 #[derive(Clone)]
@@ -856,29 +955,27 @@ async fn database_handler(
     let _ = context.closed.send(true);
 }
 
-extern "C-unwind" fn connect(state: LuaState) -> i32 {
-    let protocol_type: u8 = laux::lua_get(state, 1);
-    let owner = laux::lua_get(state, 2);
-    let session: i64 = laux::lua_get(state, 3);
+fn connect_impl(state: LuaState) -> LuaResult {
+    let protocol_type: u8 = checked_integer(state, 1)?;
+    let owner = checked_integer(state, 2)?;
+    let session: i64 = checked_integer(state, 3)?;
 
     // The async task outlives this Lua call, so never retain references into
     // the Lua stack here.
-    let database_url = checked_string(state, 4);
-    let name = checked_string(state, 5);
-    let connect_timeout = positive_option(state, 6, 5000, u32::MAX as i64) as u64;
-    let request_timeout_ms = positive_option(state, 7, 30000, u32::MAX as i64) as u64;
-    let max_rows = positive_option(state, 8, 100000, i32::MAX as i64) as usize;
-    let queue_capacity = positive_option(state, 9, 100, i32::MAX as i64) as usize;
-    let reconnect_initial_delay = bounded_option(state, 10, 250, 0, u32::MAX as i64) as u64;
-    let reconnect_max_delay = positive_option(state, 11, 5000, u32::MAX as i64) as u64;
-    let reconnect_log_interval = bounded_option(state, 12, 5000, 0, u32::MAX as i64) as u64;
+    let database_url = checked_string(state, 4)?;
+    let name = checked_string(state, 5)?;
+    let connect_timeout = positive_option(state, 6, 5000, u32::MAX as i64)? as u64;
+    let request_timeout_ms = positive_option(state, 7, 30000, u32::MAX as i64)? as u64;
+    let max_rows = positive_option(state, 8, 100000, i32::MAX as i64)? as usize;
+    let queue_capacity = positive_option(state, 9, 100, i32::MAX as i64)? as usize;
+    let reconnect_initial_delay = bounded_option(state, 10, 250, 0, u32::MAX as i64)? as u64;
+    let reconnect_max_delay = positive_option(state, 11, 5000, u32::MAX as i64)? as u64;
+    let reconnect_log_interval = bounded_option(state, 12, 5000, 0, u32::MAX as i64)? as u64;
     if reconnect_max_delay < reconnect_initial_delay {
-        laux::lua_error(
-            state,
-            "SQLx reconnect_max_delay must be >= reconnect_initial_delay".to_string(),
-        );
+        return Err("SQLx reconnect_max_delay must be >= reconnect_initial_delay".to_string());
     }
 
+    let guard = response_guard(state, owner, session)?;
     CONTEXT.tokio_runtime.spawn(async move {
         match DatabaseBackend::connect(&database_url, Duration::from_millis(connect_timeout)).await
         {
@@ -953,8 +1050,7 @@ extern "C-unwind" fn connect(state: LuaState) -> i32 {
         };
     });
 
-    laux::lua_push(state, session);
-    1
+    return_session(state, session, guard)
 }
 
 fn utf8_string(bytes: &[u8], context: &str) -> Result<String, String> {
@@ -984,7 +1080,7 @@ fn parse_null_type(type_name: &str) -> Result<NullType, String> {
 
 fn get_typed_query_param(wrapper: &LuaTable) -> Result<Option<QueryParams>, String> {
     let kind = {
-        let marker = wrapper.rawget("__sqlx_param");
+        let marker = wrapper.raw_get("__sqlx_param");
         match &marker.value {
             LuaValue::Nil | LuaValue::None => return Ok(None),
             LuaValue::String(value) => utf8_string(value, "sqlx parameter kind")?,
@@ -995,7 +1091,7 @@ fn get_typed_query_param(wrapper: &LuaTable) -> Result<Option<QueryParams>, Stri
     match kind.as_str() {
         "null" => {
             let type_name = {
-                let field = wrapper.rawget("type");
+                let field = wrapper.raw_get("type");
                 match &field.value {
                     LuaValue::Nil | LuaValue::None => "text".to_string(),
                     LuaValue::String(value) => utf8_string(value, "sqlx.null type")?,
@@ -1005,7 +1101,7 @@ fn get_typed_query_param(wrapper: &LuaTable) -> Result<Option<QueryParams>, Stri
             Ok(Some(QueryParams::Null(parse_null_type(&type_name)?)))
         }
         "text" => {
-            let field = wrapper.rawget("value");
+            let field = wrapper.raw_get("value");
             match &field.value {
                 LuaValue::String(value) => Ok(Some(QueryParams::Text(utf8_string(
                     value,
@@ -1015,14 +1111,14 @@ fn get_typed_query_param(wrapper: &LuaTable) -> Result<Option<QueryParams>, Stri
             }
         }
         "bytes" => {
-            let field = wrapper.rawget("value");
+            let field = wrapper.raw_get("value");
             match &field.value {
                 LuaValue::String(value) => Ok(Some(QueryParams::Bytes(value.to_vec()))),
                 _ => Err("sqlx.bytes value must be a string".to_string()),
             }
         }
         "json" => {
-            let field = wrapper.rawget("value");
+            let field = wrapper.raw_get("value");
             lua_value_to_json(&field.value, 0)
                 .map(QueryParams::Json)
                 .map(Some)
@@ -1045,9 +1141,9 @@ fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
             }
 
             let is_array_wrapper = {
-                let marker = val.rawget("__sqlx_array");
+                let marker = val.raw_get("__sqlx_array");
                 matches!(&marker.value, LuaValue::Boolean(true))
-            } || val.getmetafield(cstr!("__sqlx_array")).is_some();
+            } || val.meta_field(c"__sqlx_array").is_some();
             if is_array_wrapper {
                 return get_pg_array_param(&val);
             }
@@ -1057,7 +1153,7 @@ fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
         _t => {
             return Err(format!(
                 "get_query_param: unsupport value type :{}",
-                laux::type_name(state, i)
+                laux::type_name(state, unsafe { ffi::lua_type(state.as_ptr(), i) })
             ));
         }
     };
@@ -1072,13 +1168,13 @@ fn collect_pg_array<T, F>(
 where
     F: for<'a> FnMut(LuaValue<'a>) -> Option<T>,
 {
-    let (is_array, len) = values.array_len();
-    if !is_array && values.iter().next().is_some() {
+    let (is_array, len) = values.array_shape();
+    if !is_array && values.pairs().next().is_some() {
         return Err("sqlx.array values must be a Lua sequence".to_string());
     }
 
     let mut result = Vec::with_capacity(len);
-    for (index, value) in values.array_iter().enumerate() {
+    for (index, value) in values.values(len).enumerate() {
         match value {
             LuaValue::LightUserData(ptr) if ptr.is_null() => result.push(None),
             value => match convert(value) {
@@ -1119,17 +1215,19 @@ fn lua_table_to_json(table: &LuaTable, depth: usize) -> Result<serde_json::Value
     if depth >= 64 {
         return Err("SQL JSON table nesting exceeds 64 levels (possibly cyclic)".to_string());
     }
-    laux::lua_checkstack(table.lua_state(), 6, cstr!("sqlx.json.table"));
-    let (is_array, len) = table.array_len();
+    if unsafe { ffi::lua_checkstack(table.lua_state().as_ptr(), 6) } == 0 {
+        return Err("SQLx JSON traversal exhausted Lua stack".to_string());
+    }
+    let (is_array, len) = table.array_shape();
     if is_array {
         let mut values = Vec::with_capacity(len);
-        for value in table.expected_array_iter(len) {
+        for value in table.values(len) {
             values.push(lua_value_to_json(&value, depth + 1)?);
         }
         return Ok(serde_json::Value::Array(values));
     }
     let mut values = serde_json::Map::new();
-    for (key, value) in table.iter() {
+    for (key, value) in table.pairs() {
         let key = match key {
             LuaValue::String(key) => utf8_string(key, "SQL JSON object key")?,
             LuaValue::Integer(key) => key.to_string(),
@@ -1150,14 +1248,14 @@ fn lua_table_to_json(table: &LuaTable, depth: usize) -> Result<serde_json::Value
 
 fn get_pg_array_param(wrapper: &LuaTable) -> Result<QueryParams, String> {
     let type_name = {
-        let field = wrapper.rawget("type");
+        let field = wrapper.raw_get("type");
         match &field.value {
             LuaValue::String(value) => utf8_string(value, "sqlx.array type")?,
             _ => return Err("sqlx.array type must be a string".to_string()),
         }
     };
 
-    let values_field = wrapper.rawget("values");
+    let values_field = wrapper.raw_get("values");
     let values = match &values_field.value {
         LuaValue::Table(value) => value,
         _ => return Err("sqlx.array values must be a table".to_string()),
@@ -1252,12 +1350,12 @@ fn get_pg_array_param(wrapper: &LuaTable) -> Result<QueryParams, String> {
     }
 }
 
-fn enqueue_query(state: LuaState, execute_only: bool) -> i32 {
+fn enqueue_query(state: LuaState, execute_only: bool) -> LuaResult {
     let mut args = LuaArgs::new(1);
-    let conn = connection_arg(state, args.iter_arg());
+    let conn = connection_arg(state, args.iter_arg())?;
 
-    let owner = laux::lua_get(state, args.iter_arg());
-    let session = laux::lua_get(state, args.iter_arg());
+    let owner = checked_integer(state, args.iter_arg())?;
+    let session = checked_integer(state, args.iter_arg())?;
 
     if conn.closing.load(Ordering::Acquire) {
         push_lua_table!(
@@ -1265,10 +1363,10 @@ fn enqueue_query(state: LuaState, execute_only: bool) -> i32 {
             "kind" => "CLOSED",
             "message" => "database connection is closing"
         );
-        return 1;
+        return Ok(1);
     }
 
-    let sql = checked_string(state, args.iter_arg());
+    let sql = checked_string(state, args.iter_arg())?;
     let mut params = Vec::new();
     let top = laux::lua_top(state);
     for i in args.iter_arg()..=top {
@@ -1278,12 +1376,7 @@ fn enqueue_query(state: LuaState, execute_only: bool) -> i32 {
                 params.push(value);
             }
             Err(err) => {
-                push_lua_table!(
-                    state,
-                    "kind" => "ERROR",
-                    "message" => err
-                );
-                return 1;
+                return Err(err);
             }
         }
     }
@@ -1295,13 +1388,12 @@ fn enqueue_query(state: LuaState, execute_only: bool) -> i32 {
         DatabaseRequest::Query(owner, session, query)
     };
 
+    let guard = response_guard(state, owner, session)?;
     conn.counter.fetch_add(1, Ordering::AcqRel);
     match conn.tx.try_send(request) {
-        Ok(_) => {
-            laux::lua_push(state, session);
-            1
-        }
+        Ok(_) => return_session(state, session, guard),
         Err(err) => {
+            abandon_guard(state, guard);
             conn.counter.fetch_sub(1, Ordering::AcqRel);
             let kind = if matches!(&err, mpsc::error::TrySendError::Full(_)) {
                 "BUSY"
@@ -1313,25 +1405,25 @@ fn enqueue_query(state: LuaState, execute_only: bool) -> i32 {
                 "kind" => kind,
                 "message" => err.to_string()
             );
-            1
+            Ok(1)
         }
     }
 }
 
-extern "C-unwind" fn query(state: LuaState) -> i32 {
+fn query_impl(state: LuaState) -> LuaResult {
     enqueue_query(state, false)
 }
 
-extern "C-unwind" fn execute(state: LuaState) -> i32 {
+fn execute_impl(state: LuaState) -> LuaResult {
     enqueue_query(state, true)
 }
 
-extern "C-unwind" fn batch(state: LuaState) -> i32 {
+fn batch_impl(state: LuaState) -> LuaResult {
     let mut args = LuaArgs::new(1);
-    let conn = connection_arg(state, args.iter_arg());
-    let owner = laux::lua_get(state, args.iter_arg());
-    let session = laux::lua_get(state, args.iter_arg());
-    let sql = checked_string(state, args.iter_arg());
+    let conn = connection_arg(state, args.iter_arg())?;
+    let owner = checked_integer(state, args.iter_arg())?;
+    let session = checked_integer(state, args.iter_arg())?;
+    let sql = checked_string(state, args.iter_arg())?;
 
     if conn.closing.load(Ordering::Acquire) {
         push_lua_table!(
@@ -1339,16 +1431,18 @@ extern "C-unwind" fn batch(state: LuaState) -> i32 {
             "kind" => "CLOSED",
             "message" => "database connection is closing"
         );
-        return 1;
+        return Ok(1);
     }
 
+    let guard = response_guard(state, owner, session)?;
     conn.counter.fetch_add(1, Ordering::AcqRel);
     match conn
         .tx
         .try_send(DatabaseRequest::Batch(owner, session, sql))
     {
-        Ok(_) => laux::lua_push(state, session),
+        Ok(_) => return return_session(state, session, guard),
         Err(err) => {
+            abandon_guard(state, guard);
             conn.counter.fetch_sub(1, Ordering::AcqRel);
             let kind = if matches!(&err, mpsc::error::TrySendError::Full(_)) {
                 "BUSY"
@@ -1362,7 +1456,7 @@ extern "C-unwind" fn batch(state: LuaState) -> i32 {
             );
         }
     }
-    1
+    Ok(1)
 }
 
 struct TransactionQuerys {
@@ -1371,13 +1465,17 @@ struct TransactionQuerys {
 
 impl SqlxUserdata for TransactionQuerys {
     const METATABLE: &'static CStr = c"sqlx_transaction_metatable";
+    fn metatable_key() -> *const std::ffi::c_void {
+        static KEY: u8 = 0;
+        (&KEY as *const u8).cast()
+    }
 }
 
-extern "C-unwind" fn push_transaction_query(state: LuaState) -> i32 {
+fn push_transaction_query_impl(state: LuaState) -> LuaResult {
     // Validate now, but don't hold a mutable borrow across parameter encoding
     // (Lua metamethods can re-enter this function).
-    userdata_ptr::<TransactionQuerys>(state, 1);
-    let sql = checked_string(state, 2);
+    userdata_ptr::<TransactionQuerys>(state, 1)?;
+    let sql = checked_string(state, 2)?;
     let mut params = Vec::new();
     let top = laux::lua_top(state);
     for i in 3..=top {
@@ -1387,41 +1485,40 @@ extern "C-unwind" fn push_transaction_query(state: LuaState) -> i32 {
                 params.push(value);
             }
             Err(err) => {
-                drop(params);
-                laux::lua_error(state, err);
+                return Err(err);
             }
         }
     }
 
-    let querys = unsafe { &mut *userdata_ptr::<TransactionQuerys>(state, 1) };
-    let querys = querys.as_mut().unwrap_or_else(|| {
-        laux::lua_error(state, "SQLx transaction has been collected".to_string())
-    });
+    let querys = unsafe { &mut *userdata_ptr::<TransactionQuerys>(state, 1)? };
+    let querys = querys
+        .as_mut()
+        .ok_or_else(|| "SQLx transaction has been collected".to_string())?;
     querys.querys.push(DatabaseQuery { sql, binds: params });
 
-    0
+    Ok(0)
 }
 
-extern "C-unwind" fn make_transaction(state: LuaState) -> i32 {
+fn make_transaction_impl(state: LuaState) -> LuaResult {
     push_userdata(
         state,
         TransactionQuerys { querys: Vec::new() },
         &[lreg!("push", push_transaction_query), lreg_null!()],
     );
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn transaction(state: LuaState) -> i32 {
+fn transaction_impl(state: LuaState) -> LuaResult {
     let mut args = LuaArgs::new(1);
-    let conn = connection_arg(state, args.iter_arg());
+    let conn = connection_arg(state, args.iter_arg())?;
 
-    let owner = laux::lua_get(state, args.iter_arg());
-    let session = laux::lua_get(state, args.iter_arg());
+    let owner = checked_integer(state, args.iter_arg())?;
+    let session = checked_integer(state, args.iter_arg())?;
 
-    let querys = unsafe { &mut *userdata_ptr::<TransactionQuerys>(state, args.iter_arg()) };
-    let querys = querys.as_mut().unwrap_or_else(|| {
-        laux::lua_error(state, "SQLx transaction has been collected".to_string())
-    });
+    let querys_ptr = userdata_ptr::<TransactionQuerys>(state, args.iter_arg())?;
+    if unsafe { &*querys_ptr }.is_none() {
+        return Err("SQLx transaction has been collected".to_string());
+    }
 
     if conn.closing.load(Ordering::Acquire) {
         push_lua_table!(
@@ -1429,17 +1526,25 @@ extern "C-unwind" fn transaction(state: LuaState) -> i32 {
             "kind" => "CLOSED",
             "message" => "database connection is closing"
         );
-        return 1;
+        return Ok(1);
     }
 
-    let request = DatabaseRequest::Transaction(owner, session, std::mem::take(&mut querys.querys));
+    let guard = response_guard(state, owner, session)?;
+    // Allocating the response lease can run Lua GC/finalizers. Never hold a
+    // mutable userdata reference across it, and recheck after that allocation.
+    let requests = match unsafe { &mut *querys_ptr } {
+        Some(querys) => std::mem::take(&mut querys.querys),
+        None => {
+            abandon_guard(state, guard);
+            return Err("SQLx transaction has been collected".to_string());
+        }
+    };
+    let request = DatabaseRequest::Transaction(owner, session, requests);
     conn.counter.fetch_add(1, Ordering::AcqRel);
     match conn.tx.try_send(request) {
-        Ok(_) => {
-            laux::lua_push(state, session);
-            1
-        }
+        Ok(_) => return_session(state, session, guard),
         Err(err) => {
+            abandon_guard(state, guard);
             conn.counter.fetch_sub(1, Ordering::AcqRel);
             let kind = if matches!(&err, mpsc::error::TrySendError::Full(_)) {
                 "BUSY"
@@ -1448,24 +1553,28 @@ extern "C-unwind" fn transaction(state: LuaState) -> i32 {
             };
             let message = err.to_string();
             if let DatabaseRequest::Transaction(_, _, requests) = err.into_inner() {
-                querys.querys = requests;
+                // No Lua operation between take(), try_send() and this restore.
+                if let Some(querys) = unsafe { &mut *querys_ptr } {
+                    querys.querys = requests;
+                }
             }
             push_lua_table!(
                 state,
                 "kind" => kind,
                 "message" => message
             );
-            1
+            Ok(1)
         }
     }
 }
 
-extern "C-unwind" fn close(state: LuaState) -> i32 {
-    let conn = connection_arg(state, 1);
-    let protocol_type: u8 = laux::lua_get(state, 2);
-    let owner: u32 = laux::lua_get(state, 3);
-    let session: i64 = laux::lua_get(state, 4);
+fn close_impl(state: LuaState) -> LuaResult {
+    let conn = connection_arg(state, 1)?;
+    let protocol_type: u8 = checked_integer(state, 2)?;
+    let owner: u32 = checked_integer(state, 3)?;
+    let session: i64 = checked_integer(state, 4)?;
 
+    let guard = response_guard(state, owner, session)?;
     let first_close = !conn.closing.swap(true, Ordering::AcqRel);
     let tx = conn.tx.clone();
     let mut closed = conn.closed.clone();
@@ -1483,8 +1592,7 @@ extern "C-unwind" fn close(state: LuaState) -> i32 {
         send_response(protocol_type, owner, session, response);
     });
 
-    laux::lua_push(state, session);
-    1
+    return_session(state, session, guard)
 }
 
 #[derive(Copy, Clone)]
@@ -1598,9 +1706,9 @@ fn push_sql_null(state: LuaState) {
 
 fn push_u64(state: LuaState, value: u64) {
     if let Ok(value) = i64::try_from(value) {
-        laux::lua_push(state, value);
+        lua_safe::push(state, value);
     } else {
-        laux::lua_push(state, value.to_string());
+        lua_safe::push(state, value.to_string());
     }
 }
 
@@ -1641,7 +1749,7 @@ where
     NaiveTime: sqlx::Decode<'a, DB>,
     Uuid: sqlx::Decode<'a, DB>,
 {
-    let table = LuaTable::new(state, rows.len(), 0);
+    let table = OutputTable::new(state, rows.len(), 0);
     if rows.is_empty() {
         return Ok(1);
     }
@@ -1663,7 +1771,7 @@ where
     let is_sqlite = std::any::TypeId::of::<DB>() == std::any::TypeId::of::<Sqlite>();
 
     for (i, row) in rows.iter().enumerate() {
-        let row_table = LuaTable::new(state, 0, row.len());
+        let row_table = OutputTable::new(state, 0, row.len());
         for (index, column_name, db_type) in column_info.iter() {
             let value = row
                 .try_get_raw(*index)
@@ -1805,7 +1913,7 @@ fn push_optional_array<T, F>(state: LuaState, values: Vec<Option<T>>, mut push_v
 where
     F: FnMut(LuaState, T),
 {
-    let table = LuaTable::new(state, values.len(), 0);
+    let table = OutputTable::new(state, values.len(), 0);
     for (index, value) in values.into_iter().enumerate() {
         match value {
             Some(value) => push_value(state, value),
@@ -1816,31 +1924,31 @@ where
 }
 
 fn push_json_value(state: LuaState, value: serde_json::Value) {
-    laux::lua_checkstack(state, 4, std::ptr::null());
+    lua_safe::checkstack(state, 4);
     match value {
         serde_json::Value::Null => {
             laux::lua_pushlightuserdata(state, std::ptr::null_mut());
         }
-        serde_json::Value::Bool(value) => laux::lua_push(state, value),
+        serde_json::Value::Bool(value) => lua_safe::push(state, value),
         serde_json::Value::Number(value) => {
             if let Some(value) = value.as_i64() {
-                laux::lua_push(state, value);
+                lua_safe::push(state, value);
             } else if let Some(value) = value.as_u64() {
                 push_u64(state, value);
             } else {
-                laux::lua_push(state, value.as_f64().unwrap_or_default());
+                lua_safe::push(state, value.as_f64().unwrap_or_default());
             }
         }
-        serde_json::Value::String(value) => laux::lua_push(state, value),
+        serde_json::Value::String(value) => lua_safe::push(state, value),
         serde_json::Value::Array(values) => {
-            let table = LuaTable::new(state, values.len(), 0);
+            let table = OutputTable::new(state, values.len(), 0);
             for (index, value) in values.into_iter().enumerate() {
                 push_json_value(state, value);
                 table.rawseti(index + 1);
             }
         }
         serde_json::Value::Object(values) => {
-            let table = LuaTable::new(state, 0, values.len());
+            let table = OutputTable::new(state, 0, values.len());
             for (key, value) in values {
                 table.insert_x(key.as_str(), || push_json_value(state, value));
             }
@@ -1850,7 +1958,7 @@ fn push_json_value(state: LuaState, value: serde_json::Value) {
 
 fn process_pg_array_value(
     state: LuaState,
-    row_table: &LuaTable,
+    row_table: &OutputTable,
     column_name: &str,
     type_name: &str,
     value: PgValueRef<'_>,
@@ -1866,14 +1974,14 @@ fn process_pg_array_value(
         "BOOL[]" => {
             let decoded = decode_array!(bool);
             row_table.insert_x(column_name, || {
-                push_optional_array(state, decoded, laux::lua_push)
+                push_optional_array(state, decoded, lua_safe::push)
             });
         }
         "INT2[]" => {
             let decoded = decode_array!(i16);
             row_table.insert_x(column_name, || {
                 push_optional_array(state, decoded, |state, value| {
-                    laux::lua_push(state, value as i64)
+                    lua_safe::push(state, value as i64)
                 })
             });
         }
@@ -1881,41 +1989,41 @@ fn process_pg_array_value(
             let decoded = decode_array!(i32);
             row_table.insert_x(column_name, || {
                 push_optional_array(state, decoded, |state, value| {
-                    laux::lua_push(state, value as i64)
+                    lua_safe::push(state, value as i64)
                 })
             });
         }
         "INT8[]" => {
             let decoded = decode_array!(i64);
             row_table.insert_x(column_name, || {
-                push_optional_array(state, decoded, laux::lua_push)
+                push_optional_array(state, decoded, lua_safe::push)
             });
         }
         "FLOAT4[]" => {
             let decoded = decode_array!(f32);
             row_table.insert_x(column_name, || {
                 push_optional_array(state, decoded, |state, value| {
-                    laux::lua_push(state, value as f64)
+                    lua_safe::push(state, value as f64)
                 })
             });
         }
         "FLOAT8[]" => {
             let decoded = decode_array!(f64);
             row_table.insert_x(column_name, || {
-                push_optional_array(state, decoded, laux::lua_push)
+                push_optional_array(state, decoded, lua_safe::push)
             });
         }
         "TEXT[]" | "VARCHAR[]" | "CHAR[]" | "NAME[]" => {
             let decoded = decode_array!(String);
             row_table.insert_x(column_name, || {
-                push_optional_array(state, decoded, laux::lua_push)
+                push_optional_array(state, decoded, lua_safe::push)
             });
         }
         "BYTEA[]" => {
             let decoded = decode_array!(Vec<u8>);
             row_table.insert_x(column_name, || {
                 push_optional_array(state, decoded, |state, value| {
-                    laux::lua_push(state, value.as_slice())
+                    lua_safe::push(state, value.as_slice())
                 })
             });
         }
@@ -1923,7 +2031,7 @@ fn process_pg_array_value(
             let decoded = decode_array!(Uuid);
             row_table.insert_x(column_name, || {
                 push_optional_array(state, decoded, |state, value| {
-                    laux::lua_push(state, value.to_string())
+                    lua_safe::push(state, value.to_string())
                 })
             });
         }
@@ -1941,9 +2049,39 @@ fn process_pg_array_value(
     Ok(true)
 }
 
+fn decode_pg_temporal(value: PgValueRef<'_>, db_type: DbType) -> Result<String, String> {
+    let bytes = <&[u8] as sqlx::decode::Decode<Postgres>>::decode(value.clone())
+        .map_err(|err| err.to_string())?;
+    if value.format() == PgValueFormat::Text {
+        return utf8_string(bytes, "PostgreSQL temporal value");
+    }
+    let int8 = |bytes: &[u8]| -> Result<i64, String> {
+        bytes
+            .try_into()
+            .map(i64::from_be_bytes)
+            .map_err(|_| "invalid PostgreSQL temporal int8 length".to_string())
+    };
+    let int4 = |bytes: &[u8]| -> Result<i32, String> {
+        bytes
+            .try_into()
+            .map(i32::from_be_bytes)
+            .map_err(|_| "invalid PostgreSQL temporal int4 length".to_string())
+    };
+    match db_type {
+        DbType::Date => Ok(pg_datetime::date(int4(bytes)?)),
+        DbType::Timestamp => pg_datetime::timestamp(int8(bytes)?, false),
+        DbType::TimestampTz => pg_datetime::timestamp(int8(bytes)?, true),
+        DbType::Time => pg_datetime::time(int8(bytes)?),
+        DbType::TimeTz if bytes.len() == 12 => {
+            pg_datetime::timetz(int8(&bytes[..8])?, int4(&bytes[8..])?)
+        }
+        _ => Err("invalid PostgreSQL temporal type or length".to_string()),
+    }
+}
+
 fn insert_pg_scalar_value(
     state: LuaState,
-    row_table: &LuaTable,
+    row_table: &OutputTable,
     column_name: &str,
     db_type: DbType,
     value: PgValueRef<'_>,
@@ -1968,27 +2106,10 @@ fn insert_pg_scalar_value(
         DbType::Float64 => row_table.insert(column_name, decode_value!(f64)),
         DbType::Text => row_table.insert(column_name, decode_value!(&str)),
         DbType::Bool => row_table.insert(column_name, decode_value!(bool)),
-        DbType::Timestamp => {
-            let value = decode_value!(NaiveDateTime);
-            row_table.insert(
-                column_name,
-                value.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
-            )
-        }
-        DbType::TimestampTz => {
-            let value = decode_value!(DateTime<Utc>);
-            row_table.insert(
-                column_name,
-                value.to_rfc3339_opts(SecondsFormat::AutoSi, true),
-            )
-        }
-        DbType::Date => {
-            let value = decode_value!(NaiveDate);
-            row_table.insert(column_name, value.format("%Y-%m-%d").to_string())
-        }
-        DbType::Time => {
-            let value = decode_value!(NaiveTime);
-            row_table.insert(column_name, value.format("%H:%M:%S%.f").to_string())
+        DbType::Timestamp | DbType::TimestampTz | DbType::Date | DbType::Time | DbType::TimeTz => {
+            let value = decode_pg_temporal(value, db_type)
+                .map_err(|err| format!("{column_name} decode error: {err}"))?;
+            row_table.insert(column_name, value)
         }
         DbType::Uuid => row_table.insert(column_name, decode_value!(Uuid).to_string()),
         DbType::Bytes => row_table.insert(column_name, decode_value!(&[u8])),
@@ -2003,13 +2124,6 @@ fn insert_pg_scalar_value(
                 column_name
             ));
         }
-        DbType::TimeTz => {
-            let value = decode_value!(PgTimeTz<NaiveTime, FixedOffset>);
-            row_table.insert(
-                column_name,
-                format!("{}{}", value.time.format("%H:%M:%S%.f"), value.offset),
-            )
-        }
         DbType::Unknown => {
             let bytes = <&[u8] as sqlx::decode::Decode<Postgres>>::decode(value)
                 .map_err(|err| format!("{} decode error: {}", column_name, err))?;
@@ -2021,7 +2135,7 @@ fn insert_pg_scalar_value(
 }
 
 fn process_pg_rows(state: LuaState, rows: &[PgRow]) -> Result<i32, String> {
-    let table = LuaTable::new(state, rows.len(), 0);
+    let table = OutputTable::new(state, rows.len(), 0);
     if rows.is_empty() {
         return Ok(1);
     }
@@ -2043,7 +2157,7 @@ fn process_pg_rows(state: LuaState, rows: &[PgRow]) -> Result<i32, String> {
     ensure_unique_columns(column_info.iter().map(|(_, name, _, _)| *name))?;
 
     for (row_index, row) in rows.iter().enumerate() {
-        let row_table = LuaTable::new(state, 0, row.len());
+        let row_table = OutputTable::new(state, 0, row.len());
         for (index, column_name, type_name, db_type) in &column_info {
             let value = row
                 .try_get_raw(*index)
@@ -2079,8 +2193,8 @@ fn push_connection(state: LuaState, connection: DatabaseConnection) -> i32 {
     1
 }
 
-extern "C-unwind" fn find_connection(state: LuaState) -> i32 {
-    let name = checked_string(state, 1);
+fn find_connection_impl(state: LuaState) -> LuaResult {
+    let name = checked_string(state, 1)?;
     let registration = DATABASE_CONNECTIONS
         .get(&name)
         .map(|pair| pair.value().clone());
@@ -2089,7 +2203,7 @@ extern "C-unwind" fn find_connection(state: LuaState) -> i32 {
         if !registration.closing.load(Ordering::Acquire)
             && let Some(tx) = registration.tx.upgrade()
         {
-            return push_connection(
+            return Ok(push_connection(
                 state,
                 DatabaseConnection {
                     tx,
@@ -2097,7 +2211,7 @@ extern "C-unwind" fn find_connection(state: LuaState) -> i32 {
                     closing: registration.closing,
                     closed: registration.closed,
                 },
-            );
+            ));
         }
         DATABASE_CONNECTIONS.remove_if(&name, |_, current| {
             Arc::ptr_eq(&current.identity, &registration.identity)
@@ -2105,25 +2219,24 @@ extern "C-unwind" fn find_connection(state: LuaState) -> i32 {
     }
 
     laux::lua_pushnil(state);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn decode(state: LuaState) -> i32 {
-    laux::lua_checkstack(state, 6, std::ptr::null());
-    let response_id = laux::lua_get::<isize>(state, 1);
-    let owner = laux::lua_get::<u32>(state, 2);
-    let Some((_, result)) = PENDING_RESPONSES.remove_if(&response_id, |_, res| res.owner == owner)
-    else {
+fn decode_impl(state: LuaState) -> LuaResult {
+    lua_safe::checkstack(state, 6);
+    let response_id = checked_integer::<i64>(state, 1)?;
+    let owner = checked_integer::<u32>(state, 2)?;
+    let Some(result) = RESPONSES.take((owner, response_id)) else {
         push_lua_table!(state,
             "kind" => "ERROR",
             "message" => "invalid, already consumed, or expired SQLx response id"
         );
-        return 1;
+        return Ok(1);
     };
 
-    match result.value {
+    match result {
         DatabaseResponse::PgRows(rows) => {
-            return process_pg_rows(state, &rows)
+            return Ok(process_pg_rows(state, &rows)
                 .map_err(|e| {
                     push_lua_table!(
                         state,
@@ -2131,10 +2244,10 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
                         "message" => e
                     );
                 })
-                .unwrap_or(1);
+                .unwrap_or(1));
         }
         DatabaseResponse::MysqlRows(rows) => {
-            return process_rows::<MySql>(state, &rows)
+            return Ok(process_rows::<MySql>(state, &rows)
                 .map_err(|e| {
                     push_lua_table!(
                         state,
@@ -2142,10 +2255,10 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
                         "message" => e
                     );
                 })
-                .unwrap_or(1);
+                .unwrap_or(1));
         }
         DatabaseResponse::SqliteRows(rows) => {
-            return process_rows::<Sqlite>(state, &rows)
+            return Ok(process_rows::<Sqlite>(state, &rows)
                 .map_err(|e| {
                     push_lua_table!(
                         state,
@@ -2153,30 +2266,30 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
                         "message" => e
                     );
                 })
-                .unwrap_or(1);
+                .unwrap_or(1));
         }
         DatabaseResponse::Execute {
             rows_affected,
             last_insert_id,
         } => {
-            let table = LuaTable::new(state, 0, 3);
+            let table = OutputTable::new(state, 0, 3);
             table.insert("message", "ok");
             table.insert_x("rows_affected", || push_u64(state, rows_affected));
             if let Some(last_insert_id) = last_insert_id {
                 table.insert_x("last_insert_id", || push_u64(state, last_insert_id));
             }
-            return 1;
+            return Ok(1);
         }
         DatabaseResponse::Transaction { rows_affected } => {
-            let table = LuaTable::new(state, 0, 2);
+            let table = OutputTable::new(state, 0, 2);
             table.insert("message", "ok");
             table.insert_x("rows_affected", || push_u64(state, rows_affected));
-            return 1;
+            return Ok(1);
         }
-        DatabaseResponse::Connect(connection) => return push_connection(state, connection),
+        DatabaseResponse::Connect(connection) => return Ok(push_connection(state, connection)),
         DatabaseResponse::Closed => {
-            laux::lua_push(state, true);
-            return 1;
+            lua_safe::push(state, true);
+            return Ok(1);
         }
         DatabaseResponse::Timeout(message) => {
             push_lua_table!(
@@ -2214,7 +2327,7 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
             };
             match err.as_database_error() {
                 Some(db_err) => {
-                    let table = LuaTable::new(state, 0, 6);
+                    let table = OutputTable::new(state, 0, 6);
                     table.insert("kind", "DB");
                     table.insert("message", db_err.message());
                     table.insert("error_kind", format!("{:?}", db_err.kind()));
@@ -2242,25 +2355,38 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
                 }
             }
             if let Some(ms) = retry_after_ms {
-                let table = LuaTable::from_stack(state, -1);
+                let table = OutputTable::from_stack(state, -1);
                 table.insert("connect_failed", true);
                 table.insert("retry_after_ms", ms);
             }
         }
     }
 
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn stats(state: LuaState) -> i32 {
-    let table = LuaTable::new(state, 0, DATABASE_CONNECTIONS.len());
-    DATABASE_CONNECTIONS.iter().for_each(|pair| {
-        table.insert(
-            pair.key().as_str(),
-            pair.value().counter.load(Ordering::Acquire),
-        );
-    });
-    1
+fn stats_impl(state: LuaState) -> LuaResult {
+    // Never retain a DashMap shard guard while allocating a Lua table.
+    let snapshot: Vec<_> = DATABASE_CONNECTIONS
+        .iter()
+        .map(|pair| {
+            (
+                pair.key().clone(),
+                pair.value().counter.load(Ordering::Acquire),
+            )
+        })
+        .collect();
+    let table = OutputTable::new(state, 0, snapshot.len());
+    for (name, count) in snapshot {
+        table.insert(name, count);
+    }
+    Ok(1)
+}
+
+fn response_stats_impl(state: LuaState) -> LuaResult {
+    let (waiting, ready) = RESPONSES.counts();
+    push_lua_table!(state, "waiting" => waiting, "ready" => ready);
+    Ok(1)
 }
 
 #[cfg(feature = "sqlx")]
@@ -2272,6 +2398,7 @@ pub extern "C-unwind" fn luaopen_rust_sqlx(state: LuaState) -> i32 {
         lreg!("find_connection", find_connection),
         lreg!("decode", decode),
         lreg!("stats", stats),
+        lreg!("response_stats", response_stats),
         lreg!("make_transaction", make_transaction),
         lreg_null!(),
     ];
@@ -2280,3 +2407,7 @@ pub extern "C-unwind" fn luaopen_rust_sqlx(state: LuaState) -> i32 {
 
     1
 }
+
+#[cfg(test)]
+#[path = "../../../../test/sqlx_native_cases.rs"]
+mod native_tests;

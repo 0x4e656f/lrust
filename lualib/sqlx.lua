@@ -13,6 +13,7 @@
 local moon = require "moon"
 ---@type any
 local c = require "rust.sqlx"
+assert(type(c.response_stats) == "function", "SQLx native/wrapper version mismatch: update rust.dll and sqlx.lua together")
 
 -- Keep one stable protocol across services sharing a named connection.
 local protocol_type = 23
@@ -28,6 +29,8 @@ moon.register_protocol {
 
 --- SQLx 参数、结果和配置类型；供 SQLx 包装层与 lrust_sqldriver 共同引用。
 --- SQL NULL 使用 json.null（空 lightuserdata），不是 Lua nil；日期/时间/UUID 返回字符串。
+--- PG 日期支持 infinity/-infinity 与完整有限范围；TIME/TIMETZ 保留 24:00:00。
+--- 日期采用 ISO 天文年份（0000 为公元前 1 年），超出四位数的正年份带 +。
 ---@alias SqlXNullValue userdata 仅指 json.null（空 lightuserdata），不是任意 userdata。
 ---@alias SqlXValue boolean|number|string|SqlXNullValue|table
 ---@alias SqlXRow table<string, SqlXValue>
@@ -117,15 +120,19 @@ moon.register_protocol {
 ---@alias SqlXStats table<string, integer> 命名连接到请求数的映射，包含排队和执行中请求。
 
 --- Rust userdata 的内部接口；业务代码通过 SqlX 包装层调用。
+--- 原生异步接口的第二个返回值为响应租约，必须保存到等待结束并使用 <close>。
+--- 包装层已自动管理；不要单独更新 Lua 文件而仍加载旧版 rust.dll。
+---@alias SqlXResponseLease userdata
+
 ---@class SqlXNativeTransaction
----@field push fun(self: SqlXNativeTransaction, sql: string, ...: SqlXParam)
+---@field push fun(self: SqlXNativeTransaction, sql: string, ...: SqlXParam): SqlXError?
 
 ---@class SqlXNativeConnection
----@field query fun(self: SqlXNativeConnection, owner: integer, session: integer, sql: string, ...: SqlXParam): integer|SqlXError
----@field execute fun(self: SqlXNativeConnection, owner: integer, session: integer, sql: string, ...: SqlXParam): integer|SqlXError
----@field batch fun(self: SqlXNativeConnection, owner: integer, session: integer, sql: string): integer|SqlXError
----@field transaction fun(self: SqlXNativeConnection, owner: integer, session: integer, transaction: SqlXNativeTransaction): integer|SqlXError
----@field close fun(self: SqlXNativeConnection, protocol: integer, owner: integer, session: integer): integer|SqlXError
+---@field query fun(self: SqlXNativeConnection, owner: integer, session: integer, sql: string, ...: SqlXParam): integer|SqlXError, SqlXResponseLease?
+---@field execute fun(self: SqlXNativeConnection, owner: integer, session: integer, sql: string, ...: SqlXParam): integer|SqlXError, SqlXResponseLease?
+---@field batch fun(self: SqlXNativeConnection, owner: integer, session: integer, sql: string): integer|SqlXError, SqlXResponseLease?
+---@field transaction fun(self: SqlXNativeConnection, owner: integer, session: integer, transaction: SqlXNativeTransaction): integer|SqlXError, SqlXResponseLease?
+---@field close fun(self: SqlXNativeConnection, protocol: integer, owner: integer, session: integer): integer|SqlXError, SqlXResponseLease?
 
 --- 模块同时作为连接对象的方法表。每个命名连接串行执行已接收的请求。
 ---@class SqlX
@@ -144,8 +151,12 @@ end
 --- Moon 等待被中断时转成 ERROR；这里只等待会话，不额外设置超时或重试请求。
 ---@async
 ---@param session integer|SqlXError 会话 ID，或未入队就产生的错误。
+---@param guard? SqlXResponseLease 原生请求附带的响应租约，等待退出时自动释放。
 ---@return any result 会话协议解码后的动态响应；具体返回类型由公开接口约束。
-local function wait_result(session)
+local function wait_result(session, guard)
+    -- __close also runs on an interrupted wait or Lua exception; __gc handles
+    -- service destruction. This abandons the reply, never the accepted SQL.
+    local response_guard <close> = guard
     if type(session) == "table" then
         return session
     end
@@ -168,11 +179,11 @@ local function invoke(self, method, session, ...)
     if obj == nil then
         return failure("CLOSED", "database connection is closed")
     end
-    local ok, res = pcall(obj[method], obj, moon.id, session, ...)
+    local ok, res, guard = pcall(obj[method], obj, moon.id, session, ...)
     if not ok then
         return failure("ERROR", res)
     end
-    return res
+    return res, guard
 end
 
 --- 记录不等待接口在提交阶段遇到的错误；正常提交不输出日志。
@@ -312,7 +323,7 @@ function M.try_connect(database_url, name, options)
         connect_timeout = options
     end
 
-    local ok, session = pcall(c.connect,
+    local ok, session, guard = pcall(c.connect,
         protocol_type,
         moon.id,
         moon.next_sequence(),
@@ -328,7 +339,7 @@ function M.try_connect(database_url, name, options)
     if not ok then
         return nil, failure("ERROR", session)
     end
-    local res = wait_result(session)
+    local res = wait_result(session, guard)
     if type(res) == "table" and res.kind then
         return nil, res
     end
@@ -363,6 +374,9 @@ end
 ---@return SqlX? connection 不存在、已释放或已进入关闭流程时返回 nil。
 function M.find_connection(name)
     local obj = c.find_connection(name)
+    if type(obj) == "table" and obj.kind then
+        error(obj.message, 2)
+    end
     if obj == nil then
         return nil
     end
@@ -380,6 +394,14 @@ function M.stats()
     return c.stats()
 end
 
+--- 获取本进程 SQLx 响应等待状态；只读快照，不访问数据库，不改变任何容量限制。
+--- waiting 为仍在等待完成的请求数，ready 为已完成但 Lua 尚未解码的结果数。
+--- 等待中断/服务销毁会释放响应；丢弃响应不会取消、回滚或重放已接收的 SQL。
+---@return {waiting: integer, ready: integer} stats
+function M.response_stats()
+    return c.response_stats()
+end
+
 --- 发起优雅关闭：停止接受新请求，等待已接收请求处理完，再关闭底层连接。
 --- 挂起当前协程直到关闭完成；包含先前 execute 等不等待接口已成功提交的请求。
 --- 关闭的是共享连接，而不只是当前包装对象；其他持有者之后提交请求也会得到 CLOSED。
@@ -395,8 +417,8 @@ function M:close()
     if self.obj == nil then
         return true
     end
-    local session = self.obj:close(protocol_type, moon.id, moon.next_sequence())
-    local res = wait_result(session)
+    local session, guard = self.obj:close(protocol_type, moon.id, moon.next_sequence())
+    local res = wait_result(session, guard)
     if type(res) == "table" and res.kind then
         return nil, res
     end
@@ -484,6 +506,7 @@ local function make_transaction(queries)
     end
     assert(keys == count, "SQLx transaction queries must be a sequence without holes")
     local trans = c.make_transaction()
+    if type(trans) == "table" and trans.kind then error(trans.message, 0) end
     for i = 1, count do
         local query = queries[i]
         assert(type(query) == "table" and type(query[1]) == "string",
@@ -491,7 +514,8 @@ local function make_transaction(queries)
         local n = query.n or #query
         assert(math.type(n) == "integer" and n >= 1,
             "SQLx transaction statement length must be a positive integer")
-        trans:push(table.unpack(query, 1, n))
+        local result = trans:push(table.unpack(query, 1, n))
+        if type(result) == "table" and result.kind then error(result.message, 0) end
     end
     return trans
 end
