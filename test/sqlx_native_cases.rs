@@ -204,3 +204,137 @@ fn temporal_format_matches_existing_finite_values() {
         );
     }
 }
+
+#[test]
+fn execution_evidence_is_preserved_without_claiming_unknown_writes_are_safe() {
+    let _serial = SERIAL.lock().unwrap();
+    let lua = Lua::new();
+    fn socket() -> sqlx::Error {
+        sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "test disconnect",
+        ))
+    }
+    let cases = [
+        (
+            classify_execution(DatabaseResponse::Error(socket()), false),
+            "SOCKET",
+            true,
+        ),
+        (
+            classify_execution(DatabaseResponse::Timeout("BEGIN deadline".into()), false),
+            "TIMEOUT",
+            true,
+        ),
+        (
+            classify_execution(DatabaseResponse::Error(socket()), true),
+            "SOCKET",
+            false,
+        ),
+        (
+            classify_execution(DatabaseResponse::Timeout("statement deadline".into()), true),
+            "TIMEOUT",
+            false,
+        ),
+        // A lost COMMIT acknowledgement is never proof that the write did not happen.
+        (
+            classify_execution(DatabaseResponse::DisconnectedError(socket()), true),
+            "SOCKET",
+            false,
+        ),
+        (
+            classify_execution(DatabaseResponse::DisconnectedError(socket()), false),
+            "SOCKET",
+            false,
+        ),
+        (
+            DatabaseResponse::ConnectFailed {
+                error: socket(),
+                retry_after_ms: 50,
+            },
+            "SOCKET",
+            true,
+        ),
+        (DatabaseResponse::ReconnectCooldown(100), "SOCKET", true),
+    ];
+    for (index, (response, kind, safe)) in cases.into_iter().enumerate() {
+        if index < 6 {
+            assert!(response.requires_disconnect());
+        }
+        let session = 90_000 + index as i64;
+        let guard = response_guard(lua.0, 42, session).unwrap();
+        send_response(23, 42, session, response);
+        lua.run(&format!(
+            "local r = sqlx.decode({session}, 42); assert(r.kind == '{kind}'); \
+             assert((r.not_executed == true) == {safe})"
+        ));
+        abandon_guard(lua.0, guard);
+    }
+    assert_eq!(RESPONSES.counts(), (0, 0));
+}
+
+#[test]
+fn transaction_phase_is_monotonic_across_local_binding_failures() {
+    // An in-memory backend exercises the same request phase tracking without an
+    // external host. Real MySQL BEGIN/COMMIT fault injection is an integration check.
+    CONTEXT.tokio_runtime.block_on(async {
+        let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        connection
+            .execute("CREATE TABLE phase_test (value INTEGER)")
+            .await
+            .unwrap();
+        let mut backend = DatabaseBackend::Sqlite(connection);
+        let invalid = DatabaseQuery {
+            sql: "INSERT INTO phase_test VALUES (?)".into(),
+            binds: vec![QueryParams::PgInt8Array(vec![Some(1)])],
+        };
+        let mut started = false;
+        assert!(backend.execute(&invalid, &mut started).await.is_err());
+        assert!(
+            !started,
+            "local binding failure must not imply a statement was attempted"
+        );
+        assert!(
+            backend
+                .transaction(std::slice::from_ref(&invalid), &mut started)
+                .await
+                .is_err()
+        );
+        assert!(
+            !started,
+            "BEGIN and a rejected first binding execute no business statement"
+        );
+        let insert = DatabaseQuery {
+            sql: "INSERT INTO phase_test VALUES (?)".into(),
+            binds: vec![QueryParams::Int(1)],
+        };
+        assert!(
+            backend
+                .transaction(&[insert, invalid], &mut started)
+                .await
+                .is_err()
+        );
+        assert!(
+            started,
+            "later binding failure must retain evidence of earlier execution"
+        );
+        let DatabaseBackend::Sqlite(connection) = &mut backend else {
+            unreachable!()
+        };
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM phase_test")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "the failed transaction must still roll back");
+
+        // A BEGIN error must not be confused with a failed business statement.
+        connection.execute("BEGIN").await.unwrap();
+        started = false;
+        assert!(backend.transaction(&[], &mut started).await.is_err());
+        assert!(!started);
+        let DatabaseBackend::Sqlite(connection) = &mut backend else {
+            unreachable!()
+        };
+        connection.execute("ROLLBACK").await.unwrap();
+    });
+}

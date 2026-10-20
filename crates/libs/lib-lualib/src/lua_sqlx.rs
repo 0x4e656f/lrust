@@ -438,10 +438,12 @@ impl DatabaseBackend {
         &mut self,
         request: &DatabaseQuery,
         max_rows: usize,
+        execution_started: &mut bool,
     ) -> Result<DatabaseResponse, sqlx::Error> {
         match self {
             Self::MySql(connection) => {
                 let query = Self::make_query(&request.sql, &request.binds)?;
+                *execution_started = true;
                 let mut stream = query.fetch(connection);
                 let mut rows = Vec::new();
                 while let Some(row) = stream.try_next().await? {
@@ -454,6 +456,7 @@ impl DatabaseBackend {
             }
             Self::Postgres(connection) => {
                 let query = Self::make_pg_query(&request.sql, &request.binds)?;
+                *execution_started = true;
                 let mut stream = query.fetch(connection);
                 let mut rows = Vec::new();
                 while let Some(row) = stream.try_next().await? {
@@ -466,6 +469,7 @@ impl DatabaseBackend {
             }
             Self::Sqlite(connection) => {
                 let query = Self::make_query(&request.sql, &request.binds)?;
+                *execution_started = true;
                 let mut stream = query.fetch(connection);
                 let mut rows = Vec::new();
                 while let Some(row) = stream.try_next().await? {
@@ -479,30 +483,34 @@ impl DatabaseBackend {
         }
     }
 
-    async fn execute(&mut self, request: &DatabaseQuery) -> Result<DatabaseResponse, sqlx::Error> {
+    async fn execute(
+        &mut self,
+        request: &DatabaseQuery,
+        execution_started: &mut bool,
+    ) -> Result<DatabaseResponse, sqlx::Error> {
         match self {
             Self::MySql(connection) => {
-                let result = Self::make_query(&request.sql, &request.binds)?
-                    .execute(connection)
-                    .await?;
+                let query = Self::make_query(&request.sql, &request.binds)?;
+                *execution_started = true;
+                let result = query.execute(connection).await?;
                 Ok(DatabaseResponse::Execute {
                     rows_affected: result.rows_affected(),
                     last_insert_id: Some(result.last_insert_id()),
                 })
             }
             Self::Postgres(connection) => {
-                let result = Self::make_pg_query(&request.sql, &request.binds)?
-                    .execute(connection)
-                    .await?;
+                let query = Self::make_pg_query(&request.sql, &request.binds)?;
+                *execution_started = true;
+                let result = query.execute(connection).await?;
                 Ok(DatabaseResponse::Execute {
                     rows_affected: result.rows_affected(),
                     last_insert_id: None,
                 })
             }
             Self::Sqlite(connection) => {
-                let result = Self::make_query(&request.sql, &request.binds)?
-                    .execute(connection)
-                    .await?;
+                let query = Self::make_query(&request.sql, &request.binds)?;
+                *execution_started = true;
+                let result = query.execute(connection).await?;
                 Ok(DatabaseResponse::Execute {
                     rows_affected: result.rows_affected(),
                     last_insert_id: u64::try_from(result.last_insert_rowid()).ok(),
@@ -511,9 +519,14 @@ impl DatabaseBackend {
         }
     }
 
-    async fn batch(&mut self, sql: &str) -> Result<DatabaseResponse, sqlx::Error> {
+    async fn batch(
+        &mut self,
+        sql: &str,
+        execution_started: &mut bool,
+    ) -> Result<DatabaseResponse, sqlx::Error> {
         match self {
             Self::MySql(connection) => {
+                *execution_started = true;
                 let result = connection.execute(sqlx::raw_sql(sql)).await?;
                 Ok(DatabaseResponse::Execute {
                     rows_affected: result.rows_affected(),
@@ -521,6 +534,7 @@ impl DatabaseBackend {
                 })
             }
             Self::Postgres(connection) => {
+                *execution_started = true;
                 let result = connection.execute(sqlx::raw_sql(sql)).await?;
                 Ok(DatabaseResponse::Execute {
                     rows_affected: result.rows_affected(),
@@ -528,6 +542,7 @@ impl DatabaseBackend {
                 })
             }
             Self::Sqlite(connection) => {
+                *execution_started = true;
                 let result = connection.execute(sqlx::raw_sql(sql)).await?;
                 Ok(DatabaseResponse::Execute {
                     rows_affected: result.rows_affected(),
@@ -540,6 +555,7 @@ impl DatabaseBackend {
     async fn transaction(
         &mut self,
         requests: &[DatabaseQuery],
+        execution_started: &mut bool,
     ) -> Result<DatabaseResponse, sqlx::Error> {
         match self {
             Self::MySql(connection) => {
@@ -548,6 +564,7 @@ impl DatabaseBackend {
                     let mut rows_affected = 0u64;
                     for request in requests {
                         let query = Self::make_query(&request.sql, &request.binds)?;
+                        *execution_started = true;
                         rows_affected = rows_affected.saturating_add(
                             query.execute(&mut *transaction).await?.rows_affected(),
                         );
@@ -577,6 +594,7 @@ impl DatabaseBackend {
                     let mut rows_affected = 0u64;
                     for request in requests {
                         let query = Self::make_pg_query(&request.sql, &request.binds)?;
+                        *execution_started = true;
                         rows_affected = rows_affected.saturating_add(
                             query.execute(&mut *transaction).await?.rows_affected(),
                         );
@@ -606,6 +624,7 @@ impl DatabaseBackend {
                     let mut rows_affected = 0u64;
                     for request in requests {
                         let query = Self::make_query(&request.sql, &request.binds)?;
+                        *execution_started = true;
                         rows_affected = rows_affected.saturating_add(
                             query.execute(&mut *transaction).await?.rows_affected(),
                         );
@@ -701,6 +720,8 @@ enum DatabaseResponse {
     MysqlRows(Vec<MySqlRow>),
     SqliteRows(Vec<SqliteRow>),
     Error(sqlx::Error),
+    // A BEGIN failure or local binding failure before any statement was attempted.
+    ErrorBeforeExecution(sqlx::Error),
     ConnectFailed {
         error: sqlx::Error,
         retry_after_ms: u64,
@@ -710,6 +731,7 @@ enum DatabaseResponse {
     // transaction commit/rollback did not complete successfully.
     DisconnectedError(sqlx::Error),
     Timeout(String),
+    TimeoutBeforeExecution(String),
     RowLimitExceeded(usize),
     Execute {
         rows_affected: u64,
@@ -783,8 +805,11 @@ impl DatabaseResponse {
         match self {
             // A cancelled/partially consumed operation must never reuse its
             // connection or defer draining its result to the next request.
-            Self::Timeout(_) | Self::RowLimitExceeded(_) | Self::DisconnectedError(_) => true,
-            Self::Error(error) => {
+            Self::Timeout(_)
+            | Self::TimeoutBeforeExecution(_)
+            | Self::RowLimitExceeded(_)
+            | Self::DisconnectedError(_) => true,
+            Self::Error(error) | Self::ErrorBeforeExecution(error) => {
                 connection_error(error)
                     || error
                         .as_database_error()
@@ -796,6 +821,20 @@ impl DatabaseResponse {
             }
             _ => false,
         }
+    }
+}
+
+// Never infer safety from SOCKET/TIMEOUT alone: only this request-local phase
+// proves that no business statement was attempted. BEGIN can be pending/failed
+// without having executed the transaction list. Once marked, it stays marked.
+fn classify_execution(response: DatabaseResponse, execution_started: bool) -> DatabaseResponse {
+    if execution_started {
+        return response;
+    }
+    match response {
+        DatabaseResponse::Error(error) => DatabaseResponse::ErrorBeforeExecution(error),
+        DatabaseResponse::Timeout(message) => DatabaseResponse::TimeoutBeforeExecution(message),
+        response => response,
     }
 }
 
@@ -821,10 +860,11 @@ fn finish_request(
             0
         };
         let message = match &response {
-            DatabaseResponse::Error(err) | DatabaseResponse::DisconnectedError(err) => {
-                Some(err.to_string())
-            }
-            DatabaseResponse::Timeout(message) => Some(message.clone()),
+            DatabaseResponse::Error(err)
+            | DatabaseResponse::ErrorBeforeExecution(err)
+            | DatabaseResponse::DisconnectedError(err) => Some(err.to_string()),
+            DatabaseResponse::Timeout(message)
+            | DatabaseResponse::TimeoutBeforeExecution(message) => Some(message.clone()),
             DatabaseResponse::ConnectFailed {
                 error,
                 retry_after_ms,
@@ -890,6 +930,9 @@ async fn database_handler(
         // This flag also catches the outer request deadline expiring during
         // a handshake. Ordinary SQL timeouts must not activate connect backoff.
         let mut connecting = backend.is_none();
+        // Kept outside the timed future so cancellation during BEGIN is known
+        // safe, while cancellation during execute/COMMIT remains uncertain.
+        let mut execution_started = false;
         let result = timeout(context.request_timeout, async {
             let connection = match backend {
                 Some(ref mut connection) => connection,
@@ -902,12 +945,20 @@ async fn database_handler(
             reconnect.reset();
             match &op {
                 DatabaseRequest::Query(_, _, query) => {
-                    connection.query(query, context.max_rows).await
+                    connection
+                        .query(query, context.max_rows, &mut execution_started)
+                        .await
                 }
-                DatabaseRequest::Execute(_, _, query) => connection.execute(query).await,
-                DatabaseRequest::Batch(_, _, sql) => connection.batch(sql).await,
+                DatabaseRequest::Execute(_, _, query) => {
+                    connection.execute(query, &mut execution_started).await
+                }
+                DatabaseRequest::Batch(_, _, sql) => {
+                    connection.batch(sql, &mut execution_started).await
+                }
                 DatabaseRequest::Transaction(_, _, queries) => {
-                    connection.transaction(queries).await
+                    connection
+                        .transaction(queries, &mut execution_started)
+                        .await
                 }
                 DatabaseRequest::Close => unreachable!("close is handled before execution"),
             }
@@ -937,6 +988,7 @@ async fn database_handler(
                 )),
             }
         };
+        let response = classify_execution(response, execution_started);
         if response.requires_disconnect() {
             // Drop the raw transport without awaiting protocol cleanup. Do not
             // retry this operation: a lost response may hide a committed write.
@@ -1361,7 +1413,8 @@ fn enqueue_query(state: LuaState, execute_only: bool) -> LuaResult {
         push_lua_table!(
             state,
             "kind" => "CLOSED",
-            "message" => "database connection is closing"
+            "message" => "database connection is closing",
+            "not_executed" => true
         );
         return Ok(1);
     }
@@ -1403,7 +1456,8 @@ fn enqueue_query(state: LuaState, execute_only: bool) -> LuaResult {
             push_lua_table!(
                 state,
                 "kind" => kind,
-                "message" => err.to_string()
+                "message" => err.to_string(),
+                "not_executed" => true
             );
             Ok(1)
         }
@@ -1429,7 +1483,8 @@ fn batch_impl(state: LuaState) -> LuaResult {
         push_lua_table!(
             state,
             "kind" => "CLOSED",
-            "message" => "database connection is closing"
+            "message" => "database connection is closing",
+            "not_executed" => true
         );
         return Ok(1);
     }
@@ -1452,7 +1507,8 @@ fn batch_impl(state: LuaState) -> LuaResult {
             push_lua_table!(
                 state,
                 "kind" => kind,
-                "message" => err.to_string()
+                "message" => err.to_string(),
+                "not_executed" => true
             );
         }
     }
@@ -1524,7 +1580,8 @@ fn transaction_impl(state: LuaState) -> LuaResult {
         push_lua_table!(
             state,
             "kind" => "CLOSED",
-            "message" => "database connection is closing"
+            "message" => "database connection is closing",
+            "not_executed" => true
         );
         return Ok(1);
     }
@@ -1561,7 +1618,8 @@ fn transaction_impl(state: LuaState) -> LuaResult {
             push_lua_table!(
                 state,
                 "kind" => kind,
-                "message" => message
+                "message" => message,
+                "not_executed" => true
             );
             Ok(1)
         }
@@ -2234,6 +2292,13 @@ fn decode_impl(state: LuaState) -> LuaResult {
         return Ok(1);
     };
 
+    let not_executed = matches!(
+        &result,
+        DatabaseResponse::ErrorBeforeExecution(_)
+            | DatabaseResponse::TimeoutBeforeExecution(_)
+            | DatabaseResponse::ConnectFailed { .. }
+            | DatabaseResponse::ReconnectCooldown(_)
+    );
     match result {
         DatabaseResponse::PgRows(rows) => {
             return Ok(process_pg_rows(state, &rows)
@@ -2291,7 +2356,7 @@ fn decode_impl(state: LuaState) -> LuaResult {
             lua_safe::push(state, true);
             return Ok(1);
         }
-        DatabaseResponse::Timeout(message) => {
+        DatabaseResponse::Timeout(message) | DatabaseResponse::TimeoutBeforeExecution(message) => {
             push_lua_table!(
                 state,
                 "kind" => "TIMEOUT",
@@ -2313,6 +2378,7 @@ fn decode_impl(state: LuaState) -> LuaResult {
             );
         }
         response @ (DatabaseResponse::Error(_)
+        | DatabaseResponse::ErrorBeforeExecution(_)
         | DatabaseResponse::DisconnectedError(_)
         | DatabaseResponse::ConnectFailed { .. }) => {
             let (err, retry_after_ms) = match response {
@@ -2320,9 +2386,9 @@ fn decode_impl(state: LuaState) -> LuaResult {
                     error,
                     retry_after_ms,
                 } => (error, Some(retry_after_ms)),
-                DatabaseResponse::Error(error) | DatabaseResponse::DisconnectedError(error) => {
-                    (error, None)
-                }
+                DatabaseResponse::Error(error)
+                | DatabaseResponse::ErrorBeforeExecution(error)
+                | DatabaseResponse::DisconnectedError(error) => (error, None),
                 _ => unreachable!(),
             };
             match err.as_database_error() {
@@ -2360,6 +2426,9 @@ fn decode_impl(state: LuaState) -> LuaResult {
                 table.insert("retry_after_ms", ms);
             }
         }
+    }
+    if not_executed {
+        OutputTable::from_stack(state, -1).insert("not_executed", true);
     }
 
     Ok(1)

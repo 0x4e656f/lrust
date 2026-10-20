@@ -40,7 +40,13 @@ for _, method in ipairs({ "query", "execute", "transaction", "batch" }) do
         assert(owner == moon.id)
         calls[#calls + 1] = { method = method, args = table.pack(...) }
         if method == "query" and (...) == "invalid" then error("invalid parameter") end
-        pending[session] = method == "query" and {} or { rows_affected = 2 }
+        if (...) == "safe-begin" then
+            pending[session] = { kind = "SOCKET", message = "BEGIN failed", not_executed = true }
+        elseif (...) == "unknown-commit" then
+            pending[session] = { kind = "SOCKET", message = "COMMIT acknowledgement lost" }
+        else
+            pending[session] = method == "query" and {} or { rows_affected = 2 }
+        end
         return session, guard(session)
     end
 end
@@ -97,6 +103,8 @@ assert(db:query("invalid").kind == "ERROR")
 assert(db:execute_wait("UPDATE mock").rows_affected == 2)
 assert(calls[#calls].method == "execute")
 assert(db:batch("SELECT 1; SELECT 2").rows_affected == 2)
+assert(db:execute_wait("safe-begin").not_executed == true)
+assert(db:execute_wait("unknown-commit").not_executed == nil)
 local statements = { table.pack("SELECT $1, $2", 1, nil) }
 assert(db:transaction(statements).rows_affected == 2)
 local trans = calls[#calls].args[1]
@@ -104,13 +112,15 @@ assert(trans.statements[1].n == 3 and trans.statements[1][3] == nil)
 local before = #calls
 assert(db:transaction({ [1] = { "SELECT 1" }, [3] = { "SELECT 3" } }).kind == "ERROR")
 assert(#calls == before, "sparse transaction must not be partially submitted")
-assert(db:transaction({ { "SELECT 1" }, { "invalid-bind" } }).kind == "ERROR")
+local invalid_transaction = db:transaction({ { "SELECT 1" }, { "invalid-bind" } })
+assert(invalid_transaction.kind == "ERROR" and invalid_transaction.not_executed == true)
 assert(#calls == before, "native Result error must not submit a partial transaction")
 local bad, baderr = sqlx.try_connect("mock", "bad", -1)
 assert(bad == nil and baderr.kind == "ERROR")
 break_wait = true
 bad, baderr = sqlx.try_connect("mock", "interrupted")
 assert(bad == nil and baderr.message == "BREAK")
+assert(baderr.not_executed == nil, "an interrupted wait must not claim SQL was never executed")
 break_wait = true
 local closed, closeerr = db:close()
 assert(closed == nil and closeerr.kind == "ERROR" and db.obj ~= nil)

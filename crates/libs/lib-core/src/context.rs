@@ -4,8 +4,40 @@ use reqwest::ClientBuilder;
 use std::time::Duration;
 use tokio::runtime::Builder;
 
+#[cfg(windows)]
+fn pin_runtime_library() {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
+    }
+
+    const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x0000_0001;
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+    let mut module = std::ptr::null_mut();
+    // This process-wide runtime keeps native worker threads alive after Lua
+    // services close. Its code must remain loaded for the same process lifetime;
+    // a Lua VM releasing its library handle must not unmap those worker threads.
+    let pinned = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            pin_runtime_library as *const () as *const u16,
+            &mut module,
+        )
+    };
+    if pinned == 0 {
+        panic!(
+            "Failed to pin Tokio runtime library: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 lazy_static! {
     pub static ref CONTEXT: Context = {
+        #[cfg(windows)]
+        pin_runtime_library();
         let tokio_runtime = Builder::new_multi_thread()
             .worker_threads(4)
             .enable_time()
@@ -14,7 +46,7 @@ lazy_static! {
 
         Context {
             http_clients: DashMap::new(),
-            tokio_runtime: tokio_runtime.expect("Init tokio runtime failed")
+            tokio_runtime: tokio_runtime.expect("Init tokio runtime failed"),
         }
     };
 }

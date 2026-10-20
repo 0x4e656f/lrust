@@ -96,6 +96,7 @@ moon.register_protocol {
 ---@alias SqlXErrorKind 'ERROR'|'DB'|'SOCKET'|'TIMEOUT'|'BUSY'|'CLOSED'
 
 ---@class SqlXError
+---@field not_executed? boolean true 仅表示本次业务 SQL 从未开始执行；缺少此字段时不能据错误类别推断可重试。
 ---@field connect_failed? boolean true 表示本次在建连/冷却阶段失败，未提交 SQL；显式 connect 失败也设置此字段。
 ---@field retry_after_ms? integer 建连冷却的剩余毫秒数；仅为本连接的建议，不代表数据库已恢复，不会自动重试。
 ---@field kind SqlXErrorKind 错误类别；TIMEOUT/SOCKET 不代表写入一定没有提交。
@@ -142,9 +143,10 @@ local M = {}
 --- 构造统一错误表；供本地校验、等待中断和已关闭句柄等失败路径使用。
 ---@param kind SqlXErrorKind 错误分类。
 ---@param message any 错误内容，统一转换为字符串。
+---@param not_executed? boolean 只有确定尚未提交任何业务 SQL 的本地失败才传 true。
 ---@return SqlXError result 含 kind 和 message 的错误表。
-local function failure(kind, message)
-    return { kind = kind, message = tostring(message) }
+local function failure(kind, message, not_executed)
+    return { kind = kind, message = tostring(message), not_executed = not_executed }
 end
 
 --- 等待原生异步请求的响应；若入队阶段已返回错误表，则直接透传且不挂起。
@@ -177,7 +179,7 @@ end
 local function invoke(self, method, session, ...)
     local obj = self.obj
     if obj == nil then
-        return failure("CLOSED", "database connection is closed")
+        return failure("CLOSED", "database connection is closed", true)
     end
     local ok, res, guard = pcall(obj[method], obj, moon.id, session, ...)
     if not ok then
@@ -525,6 +527,7 @@ end
 --- SQL 执行失败会回滚该事务；超时/断线，尤其发生在提交阶段时，最终结果可能不确定。
 --- 普通语句错误会等待显式回滚完成再返回；回滚也受本次 request_timeout 约束。
 --- COMMIT/ROLLBACK 自身失败时丢弃连接，保留错误元数据；下一条请求重连。
+--- 仅在确认没有开始执行任何业务语句时返回 not_executed=true；BEGIN 失败也属于此类。
 --- 每条语句独立绑定参数，PG 的 $1 从该语句重新编号；整个事务共用一次 request_timeout。
 --- 语句格式为 {sql, param1, ...}；有尾部 nil 时使用 table.pack(sql, ...) 保留总长度 n。
 --- 外层列表必须无空洞；构建失败不提交任何语句。允许空列表，成功的 rows_affected 为 0。
@@ -537,7 +540,7 @@ end
 function M:transaction(querys)
     local ok, trans = pcall(make_transaction, querys)
     if not ok then
-        return failure("ERROR", trans)
+        return failure("ERROR", trans, true)
     end
     return wait_result(invoke(self, "transaction", moon.next_sequence(), trans))
 end
@@ -550,7 +553,7 @@ end
 function M:execute_transaction(querys)
     local ok, trans = pcall(make_transaction, querys)
     if not ok then
-        log_error(failure("ERROR", trans))
+        log_error(failure("ERROR", trans, true))
         return
     end
     log_error(invoke(self, "transaction", 0, trans))
